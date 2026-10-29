@@ -42,6 +42,13 @@ extern "C" {
 
 struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len);
 
+/*
+ * Same as uk_allocbbuddy_init() but marks the instance as shared between
+ * cores. All allocation operations take an internal spinlock. Use this for
+ * an allocator that more than one core uses (for example the default heap).
+ */
+struct uk_alloc *uk_allocbbuddy_init_shared(void *base, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

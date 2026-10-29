@@ -11,56 +11,58 @@
 #include <uk/config.h>
 #include <uk/intctlr.h>
 #include <uk/lcpu.h>
+#include <uk/pcpuvar.h>
+#include <uk/plat/time.h>
 
 #if CONFIG_LIBUKINTCTLR_APIC
 #include <uk/arch/x86_64.h>
 #include <uk/arch/util.h>
 
-static inline int x2apic_enable(void)
+static __u64 apic_mmio_base;
+
+/*
+ * Force the local APIC into xAPIC (MMIO) mode. The EXTD bit (10)
+ * of the APIC base MSR is never set: the x2APIC TSC-deadline
+ * timer is broken on this platform, and secondary cores rely on
+ * the xAPIC one-shot timer for waking from hlt.
+ */
+static inline int xapic_enable(void)
 {
-	__u32 eax, ebx, ecx, edx;
+	__u32 eax, edx;
 
-	/* Check for x2APIC support */
-	uk_arch_x86_64_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
-	if (!(ecx & UK_ARCH_X86_64_CPUID1_ECX_X2APIC))
-		return -ENOTSUP;
+	uk_arch_x86_64_rdmsr(UK_ARCH_X86_64_APIC_MSR_BASE, &eax, &edx);
 
-	/* Check if APIC is active */
-	uk_arch_x86_64_rdmsr(UK_ARCH_X86_64_APIC_MSR_BASE,
-					    &eax, &edx);
-	if (!(eax & UK_ARCH_X86_64_APIC_BASE_EN))
-		return -ENOTSUP;
+	/* MMIO base is bits 35:12 of the base MSR; default is 0xFEE00000 */
+	apic_mmio_base = (((__u64)edx << 32) | (__u64)eax) & 0xFFFFF000UL;
+	if (!apic_mmio_base)
+		apic_mmio_base = 0xFEE00000UL;
 
-	/* Switch to x2APIC mode */
-	eax |= UK_ARCH_X86_64_APIC_BASE_EXTD;
-	uk_arch_x86_64_wrmsr(UK_ARCH_X86_64_APIC_MSR_BASE,
-					    eax, edx);
-
-	/* Set APIC software enable flag if necessary */
-	uk_arch_x86_64_rdmsr(UK_ARCH_X86_64_APIC_MSR_SVR,
-					    &eax, &edx);
-	if ((eax & UK_ARCH_X86_64_APIC_SVR_EN) == 0) {
-		eax |= UK_ARCH_X86_64_APIC_SVR_EN;
-		uk_arch_x86_64_wrmsr(UK_ARCH_X86_64_APIC_MSR_SVR,
-						    eax, edx);
-	}
+	/* Set EN (bit 11) and clear EXTD (bit 10) */
+	eax |= UK_ARCH_X86_64_APIC_BASE_EN;
+	eax &= ~UK_ARCH_X86_64_APIC_BASE_EXTD;
+	uk_arch_x86_64_wrmsr(UK_ARCH_X86_64_APIC_MSR_BASE, eax, edx);
 
 	/*
-	 * TODO: Configure spurious interrupt vector number
-	 * After power-up or reset this is 0xff, which might not be
-	 * configured in the trap table
+	 * Software enable: set the enable bit (0x100) and the spurious
+	 * vector in the SVR register at offset 0xF0.
 	 */
+	volatile __u32 *svr = (volatile __u32 *)(apic_mmio_base + 0xF0);
+
+	*svr = (*svr) | 0x100 | 0xFF;
 
 	return 0;
 }
 
-static inline void x2apic_ack_interrupt(void)
+static inline void xapic_ack_interrupt(void)
 {
-	uk_arch_x86_64_wrmsr(UK_ARCH_X86_64_APIC_MSR_EOI, 0, 0);
+	volatile __u32 *eoi = (volatile __u32 *)(apic_mmio_base + 0x0B0);
+
+	*eoi = 0;
 }
 
-#define apic_ack_interrupt	x2apic_ack_interrupt
-#define apic_enable		x2apic_enable
+
+#define apic_ack_interrupt	xapic_ack_interrupt
+#define apic_enable		xapic_enable
 #endif /* CONFIG_LIBUKINTCTLR_APIC */
 
 #include "pic.h"
@@ -90,7 +92,12 @@ static int uk_intctlr_xpic_handle_irq(void *data)
 	 * soon as we fully implement APIC and get rid of
 	 * PIC
 	 */
-	if (irq <= 16)
+	/*
+	 * The 8259 decodes irq 0..15 only. The per-vCPU LAPIC
+	 * timer uses irq 16: it must not send an EOI to the
+	 * 8259. [Ticket a5b91e7993]
+	 */
+	if (irq <= 15)
 		pic_ack_irq(irq);
 #else   /* !CONFIG_LIBUKINTCTLR_APIC */
 	pic_ack_irq(irq);

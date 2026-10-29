@@ -10,6 +10,7 @@
 
 #include <uk/acpi.h>
 #include <uk/acpi/prio.h>
+#include <uk/arch/x86_64.h>
 #include <uk/assert.h>
 #include <uk/pcpuvar.h>
 #include <uk/print.h>
@@ -22,7 +23,11 @@
 
 int uk_acpi_madt_fill_cpu_idmap(void)
 {
-	__u64 bsp_cpu_id = uk_pcpuvar_lval(0, uk_pcpuvar_cpu_id);
+	__u32 a = 0, b = 0, c = 0, d = 0;
+	uk_arch_x86_64_cpuid(1, 0, &a, &b, &c, &d);
+	__u64 bsp_cpu_id = (b >> 24) & 0xff;
+	uk_pcpuvar_lval(0, uk_pcpuvar_cpu_id) = bsp_cpu_id;
+	uk_pcpuvar_lval(0, uk_pcpuvar_cpu_idx) = 0;
 	union {
 		struct uk_acpi_madt_x2apic *x2apic;
 		struct uk_acpi_madt_lapic *lapic;
@@ -80,7 +85,7 @@ int uk_acpi_madt_fill_cpu_idmap(void)
 
 		/* Ignore cores that exceed max configured value */
 		if (unlikely(idx == CONFIG_UKPLAT_CPU_MAXCOUNT)) {
-			uk_pr_warn("Maximum number of cores exceeded.\n");
+			uk_pr_info("Configured maximum number of cores (%u) reached.\n", CONFIG_UKPLAT_CPU_MAXCOUNT);
 			break;
 		}
 	}

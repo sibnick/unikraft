@@ -126,6 +126,24 @@ const char *uk_netdev_drv_name_get(struct uk_netdev *dev);
 enum uk_netdev_state uk_netdev_state_get(struct uk_netdev *dev);
 
 /**
+ * Query current link state of the network device.
+ *
+ * @param dev
+ *   The Unikraft Network Device.
+ * @return
+ *   1 if link is up, 0 if link is down, or 1 if unhandled/unsupported by driver.
+ */
+static inline int uk_netdev_link_state_get(struct uk_netdev *dev)
+{
+	UK_ASSERT(dev);
+
+	if (!dev->ops || !dev->ops->link_state_get)
+		return 1;
+
+	return dev->ops->link_state_get(dev);
+}
+
+/**
  * Probes an unprobed Unikraft network device and turns it
  * into unconfigured state. After successful probing, the
  * driver collected information about the backend device.

@@ -41,6 +41,10 @@
 #include <uk/essentials.h>
 #include <errno.h>
 
+#if defined(CONFIG_LIBUKPCPUVAR) && CONFIG_LIBUKPCPUVAR
+#include <uk/pcpuvar.h>
+#endif /* CONFIG_LIBUKPCPUVAR */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -124,6 +128,14 @@ struct uk_alloc {
 
 extern struct uk_alloc *_uk_alloc_head;
 
+#if defined(CONFIG_LIBUKPCPUVAR) && CONFIG_LIBUKPCPUVAR
+/*
+ * Per-CPU slot: this core's standalone allocator.
+ * NULL means "use the default allocator".
+ */
+extern struct uk_alloc * __uk_pcpuvar uk_pcpuvar_percore_alloc;
+#endif /* CONFIG_LIBUKPCPUVAR */
+
 /* Iterate over all registered allocators */
 #define uk_alloc_foreach(iter)			\
 	for (iter = _uk_alloc_head;		\
@@ -135,9 +147,24 @@ struct uk_alloc *uk_alloc_get_default(void);
 #else /* !CONFIG_LIBUKALLOC_IFSTATS_PERLIB */
 static inline struct uk_alloc *uk_alloc_get_default(void)
 {
+#if defined(CONFIG_LIBUKPCPUVAR) && CONFIG_LIBUKPCPUVAR
+	struct uk_alloc *a = uk_pcpuvar_current_get(uk_pcpuvar_percore_alloc);
+
+	if (a)
+		return a;
+#endif
+
 	return _uk_alloc_head;
 }
+
 #endif /* !CONFIG_LIBUKALLOC_IFSTATS_PERLIB */
+
+/*
+ * Returns the allocator bound to the current CPU core.
+ * Returns the per-core standalone allocator when one is bound
+ * to this core, and the default allocator otherwise.
+ */
+struct uk_alloc *uk_alloc_get_current(void);
 
 /* wrapper functions */
 static inline void *uk_do_malloc(struct uk_alloc *a, __sz size)

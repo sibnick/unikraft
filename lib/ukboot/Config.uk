@@ -144,6 +144,18 @@ config LIBUKBOOT_HEAP_BASE
 	depends on LIBUKPAGING
 	depends on LIBUKBOOT_INITALLOC
 
+config LIBUKBOOT_PERCORE_HEAP
+	bool "Per-core heap partitions"
+	default n
+	depends on LIBUKBOOT_INITALLOC
+	help
+	  Split the largest free memory region at boot into N-1
+	  partitions (N = CPU max count). Each non-boot core can then
+	  run a standalone allocator instance on its own partition. The
+	  boot core keeps the remaining region as the default allocator.
+	  This enables a run-to-completion design where each core
+	  allocates only from its own memory region.
+
 # Hidden configuration option that specifies that scheduling should be
 # initialized. The check for !LIBUKBOOT_INITNOSCHED is not sufficient, as
 # the option is also not available if !LIBUKBOOT_INITALLOC is set. The

@@ -394,6 +394,12 @@ typedef int (*uk_netdev_tx_one_t)(struct uk_netdev *dev,
 				  struct uk_netdev_tx_queue *queue,
 				  struct uk_netbuf *pkt);
 
+/** Driver callback type to query link state (1 = up, 0 = down). */
+typedef int (*uk_netdev_link_state_get_t)(struct uk_netdev *dev);
+
+/** Driver callback type to stop the device and release its queues. */
+typedef int (*uk_netdev_stop_t)(struct uk_netdev *dev);
+
 /**
  * A structure containing the functions exported by a driver.
  */
@@ -426,6 +432,10 @@ struct uk_netdev_ops {
 	uk_netdev_txq_configure_t       txq_configure;
 	uk_netdev_rxq_configure_t       rxq_configure;
 	uk_netdev_start_t               start;
+	uk_netdev_stop_t                stop;           /* optional */
+
+	/** Link state query. */
+	uk_netdev_link_state_get_t      link_state_get;   /* optional */
 };
 
 /**

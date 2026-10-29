@@ -29,12 +29,23 @@ int uk_sys_ioctl(struct uk_ofile *of, int cmd, void *arg)
 	const struct uk_file *f;
 
 	if (cmd == FIONBIO) {
-		int val = *(int *)arg;
+		int val;
+
+		if (unlikely(!arg))
+			return -EFAULT;
+
+		iolock = _SHOULD_LOCK(of->mode);
+		f = of->file;
+		if (iolock)
+			uk_file_wlock(f);
+		val = *(int *)arg;
 
 		if (val)
 			uk_or(&of->mode, O_NONBLOCK);
 		else
 			uk_and(&of->mode, ~O_NONBLOCK);
+		if (iolock)
+			uk_file_wunlock(f);
 		return 0;
 	}
 

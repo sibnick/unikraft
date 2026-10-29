@@ -1,1 +1,4 @@
 _pci_register_driver
+uk_pci_read_config32
+uk_pci_write_config32
+uk_pci_read_bar

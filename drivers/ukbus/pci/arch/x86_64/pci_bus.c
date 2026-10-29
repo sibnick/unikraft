@@ -240,3 +240,47 @@ int arch_pci_probe(struct uk_alloc *pha)
 
 	return 0;
 }
+
+/*
+ * Build the CF8 address for one function and one 4-byte aligned
+ * configuration offset.
+ */
+static inline __u32 pci_conf_addr(const struct pci_address *addr,
+				  __u8 offset)
+{
+	return (__u32)PCI_ENABLE_BIT
+		| ((__u32)addr->bus << PCI_BUS_SHIFT)
+		| ((__u32)addr->devid << PCI_DEVICE_SHIFT)
+		| ((__u32)addr->function << PCI_FUNCTION_SHIFT)
+		| ((__u32)offset & 0xfcU);
+}
+
+__u32 uk_pci_read_config32(const struct pci_address *addr, __u8 offset)
+{
+	uk_arch_x86_64_outl(PCI_CONFIG_ADDR, pci_conf_addr(addr, offset));
+	return uk_arch_x86_64_inl(PCI_CONFIG_DATA);
+}
+
+void uk_pci_write_config32(const struct pci_address *addr, __u8 offset,
+			   __u32 value)
+{
+	uk_arch_x86_64_outl(PCI_CONFIG_ADDR, pci_conf_addr(addr, offset));
+	uk_arch_x86_64_outl(PCI_CONFIG_DATA, value);
+}
+
+__u64 uk_pci_read_bar(const struct pci_address *addr, __u8 bar)
+{
+	__u32 low;
+	__u64 base;
+
+	low = uk_pci_read_config32(addr, bar);
+	if (low & 0x1U) { /* I/O space BAR. The value is a port number. */
+		return (__u64)(low & ~0x3U);
+	}
+
+	base = (__u64)(low & ~0xfU);
+	if (((low >> 1) & 0x3U) == 0x2U) { /* 64-bit memory BAR */
+		base |= (__u64)uk_pci_read_config32(addr, bar + 4) << 32;
+	}
+	return base;
+}

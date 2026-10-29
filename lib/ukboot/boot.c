@@ -52,6 +52,9 @@
 #if CONFIG_LIBUKBOOT_INITBBUDDY
 #include <uk/allocbbuddy.h>
 #define uk_alloc_init uk_allocbbuddy_init
+/* The default heap is used by every core. Use the locked variant so that
+ * concurrent allocation cannot corrupt the allocator. [Ticket d4c2a6bd2a] */
+#define uk_alloc_init_default uk_allocbbuddy_init_shared
 #elif CONFIG_LIBUKBOOT_INITREGION
 #include <uk/allocregion.h>
 #define uk_alloc_init uk_allocregion_init
@@ -64,6 +67,9 @@
 #elif CONFIG_LIBUKBOOT_INITTINYALLOC
 #include <uk/tinyalloc.h>
 #define uk_alloc_init uk_tinyalloc_init
+#endif
+#ifndef uk_alloc_init_default
+#define uk_alloc_init_default uk_alloc_init
 #endif
 #if CONFIG_LIBUKBOOT_ALLOCSTACK
 #include <uk/allocstack.h>
@@ -100,6 +106,10 @@
 #include <uk/intctlr.h>
 #endif /* CONFIG_LIBUKINTCTLR */
 
+#if CONFIG_LIBUKBOOT_PERCORE_HEAP
+#include <uk/pal/page.h>
+#endif /* CONFIG_LIBUKBOOT_PERCORE_HEAP */
+
 #include "init.h"
 
 extern char **boot_argv;
@@ -116,6 +126,123 @@ struct uk_semaphore main_sema;
 #if defined(CONFIG_LIBUKBOOT_HEAP_BASE) && defined(CONFIG_LIBUKVMEM)
 static struct uk_vas kernel_vas;
 #endif /* CONFIG_LIBUKBOOT_HEAP_BASE && CONFIG_LIBUKVMEM */
+
+#if CONFIG_LIBUKBOOT_PERCORE_HEAP
+
+/*
+ * Partition of the boot heap reserved for one non-boot core.
+ * Partition i is the region for core i + 1. Core 0 keeps the
+ * remaining (default) region.
+ */
+struct percore_heap_part {
+	__uptr base;
+	__sz len;
+};
+
+static struct percore_heap_part percore_heap_parts
+	[CONFIG_UKPLAT_CPU_MAXCOUNT > 1 ?
+	 CONFIG_UKPLAT_CPU_MAXCOUNT - 1 : 1];
+
+static unsigned int percore_heap_count;
+
+/* A per-core partition smaller than this size is not useful. */
+#define UK_PERCORE_HEAP_MIN_SIZE	(16UL << 20)
+
+/*
+ * Carve one partition from the largest free memory region for each
+ * non-boot core. This function must run before uk_alloc_init() in
+ * heap_init(), since the default allocator takes ownership of the
+ * remaining free regions afterwards.
+ */
+static void percore_heap_init(void)
+{
+	struct ukplat_memregion_desc *md;
+	struct ukplat_memregion_desc *biggest = NULL;
+	unsigned int ncores = CONFIG_UKPLAT_CPU_MAXCOUNT;
+	unsigned int i;
+	__sz part;
+
+	if (ncores < 2)
+		return;
+
+	ukplat_memregion_foreach(&md, UKPLAT_MEMRT_FREE, 0, 0) {
+		if (!biggest || md->len > biggest->len)
+			biggest = md;
+	}
+
+	if (!biggest) {
+		uk_pr_info("ukboot: per-core heap: no free region found\n");
+		return;
+	}
+
+	part = UK_PAL_PAGE_ALIGN_DOWN(biggest->len / ncores);
+	if (part < UK_PERCORE_HEAP_MIN_SIZE) {
+		uk_pr_info("ukboot: per-core heap disabled: "
+			  "partition size %lu too small\n",
+			(unsigned long)part);
+		return;
+	}
+
+	for (i = 1; i < ncores; i++) {
+		void *base;
+
+		base = ukplat_memregion_alloc(part, UKPLAT_MEMRT_RESERVED,
+						UKPLAT_MEMRF_READ |
+						UKPLAT_MEMRF_WRITE);
+		if (!base)
+			break;
+
+		percore_heap_parts[i - 1].base = (__uptr)base;
+		percore_heap_parts[i - 1].len = part;
+		percore_heap_count = i;
+
+		uk_pr_info("ukboot: per-core heap: partition %u "
+			  "%p+%lu for core %u\n",
+			(unsigned int)(i - 1), (void *)base,
+			(unsigned long)part, (unsigned int)i);
+	}
+
+	if (percore_heap_count) {
+		uk_pr_info("ukboot: per-core heap: %u partition(s) "
+			  "of %lu bytes; core 0 keeps the default region\n",
+			(unsigned int)percore_heap_count,
+			(unsigned long)part);
+	} else {
+		uk_pr_info("ukboot: per-core heap: no partition carved\n");
+	}
+}
+
+unsigned int uk_percore_heap_count(void)
+{
+	return percore_heap_count;
+}
+
+int uk_percore_heap_get(unsigned int i, __uptr *base, __sz *len)
+{
+	if (i >= percore_heap_count)
+		return -EINVAL;
+
+	*base = percore_heap_parts[i].base;
+	*len = percore_heap_parts[i].len;
+	return 0;
+}
+
+#else /* CONFIG_LIBUKBOOT_PERCORE_HEAP */
+
+unsigned int uk_percore_heap_count(void)
+{
+	return 0;
+}
+
+int uk_percore_heap_get(unsigned int i, __uptr *base, __sz *len)
+{
+	(void)i;
+	(void)base;
+	(void)len;
+	return -ENOTSUP;
+}
+
+#endif /* CONFIG_LIBUKBOOT_PERCORE_HEAP */
 
 static struct uk_alloc *heap_init()
 {
@@ -161,8 +288,8 @@ static struct uk_alloc *heap_init()
 	if (unlikely(rc))
 		return NULL;
 
-	a = uk_alloc_init((void *)heap_base,
-			  HEAP_INITIAL_PAGES << UK_PAGING_PAGE_SHIFT);
+	a = uk_alloc_init_default((void *)heap_base,
+				  HEAP_INITIAL_PAGES << UK_PAGING_PAGE_SHIFT);
 	if (unlikely(!a))
 		return NULL;
 
@@ -199,8 +326,8 @@ static struct uk_alloc *heap_init()
 	if (unlikely(rc))
 		return NULL;
 
-	a = uk_alloc_init((void *)heap_base,
-			  alloc_pages << UK_PAGING_PAGE_SHIFT);
+	a = uk_alloc_init_default((void *)heap_base,
+				  alloc_pages << UK_PAGING_PAGE_SHIFT);
 #endif /* !CONFIG_LIBUKVMEM */
 #else /* CONFIG_LIBUKBOOT_HEAP_BASE */
 	/* Paging is disabled so we still have the static boot page table set
@@ -210,6 +337,13 @@ static struct uk_alloc *heap_init()
 	 * again with the next region. As soon we have an allocator, we simply
 	 * add every subsequent region to it.
 	 */
+#if CONFIG_LIBUKBOOT_PERCORE_HEAP
+	/* Reserve one region per non-boot core before the default
+	 * allocator claims the remaining free regions.
+	 */
+	percore_heap_init();
+#endif /* CONFIG_LIBUKBOOT_PERCORE_HEAP */
+
 	ukplat_memregion_foreach(&md, UKPLAT_MEMRT_FREE, 0, 0) {
 		UK_ASSERT_VALID_FREE_MRD(md);
 
@@ -224,7 +358,7 @@ static struct uk_alloc *heap_init()
 			    );
 
 		if (!a)
-			a = uk_alloc_init((void *)md->vbase, md->len);
+			a = uk_alloc_init_default((void *)md->vbase, md->len);
 		else
 			uk_alloc_addmem(a, (void *)md->vbase, md->len);
 	}

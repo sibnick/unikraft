@@ -292,8 +292,26 @@ ENTRY(lcpu_start64)
 	cpuid
 	shrl	$24, %ebx
 
-	/* Use APIC_ID for indexing the cpu var array */
-	uk_pcpuvar_x86_64_gsval	%rsp, %rbx
+	/*
+	 * RSP is 0 here (the 16-bit entry does not set it up). Find the
+	 * per-CPU slot whose uk_pcpuvar_cpu_id matches the APIC ID in %rbx
+	 * and put that slot's offset in RSP.
+	 */
+	movl	%ebx, %eax
+	xorq	%r9, %r9
+1:
+	cmpl	$CONFIG_UKPLAT_CPU_MAXCOUNT, %r9d
+	jae	fail_noslot
+	uk_pcpuvar_x86_64_gsval	%r10, %r9
+	leaq	uk_pcpuvar_cpu_id(%rip), %r11
+	addq	%r10, %r11
+	cmpq	%rbx, (%r11)
+	je	2f
+	incq	%r9
+	jmp	1b
+2:
+	movq	%r10, %rsp
+	/* %rsp now holds the offset for the matching cpu slot */
 
 	/* Compute pointer into CPU variables array and store it in RBP
 	 * We do not use the frame pointer, yet
@@ -397,7 +415,20 @@ no_avx512:
 .pushsection .rodata
 lcpu_start64_fail_msg:
 .string "\nCRIT: Failed to boot on unsupported CPU: An extension is missing.\n"
+lcpu_start64_noslot_msg:
+.string "\nCRIT: No pcpuvar slot matches this APIC ID. Halting.\n"
 .popsection
+
+fail_noslot:
+	/* This APIC ID has no matching pcpuvar slot. Park this CPU. */
+	LCPU_EARLY_COM1_INIT
+	LCPU_EARLY_COM1_PRINT lcpu_start64_noslot_msg
+
+fail_noslot_loop:
+	cli
+1:
+	hlt
+	jmp	1b
 
 fail:
 	/* Briefly initialize COM1 and print error message */

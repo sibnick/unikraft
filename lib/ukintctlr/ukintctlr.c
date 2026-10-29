@@ -30,6 +30,7 @@
 #include <uk/atomic.h>
 #include <uk/bitops/bitmap.h>
 #include <uk/lcpu.h>
+#include <uk/pcpuvar.h>
 #include <uk/plat/time.h>
 #include <uk/intctlr.h>
 #include <uk/intctlr/limits.h>
@@ -55,6 +56,14 @@
 #define LAST_ALLOCABLE_IRQ		UK_INTCTLR_LAST_ALLOCABLE_IRQ
 
 struct uk_intctlr_desc *uk_intctlr;
+
+/*
+ * Per-vCPU early-wake flags. Set by uk_intctlr_irq_handle() for any
+ * non-timer interrupt and consumed by the per-CPU halting loop
+ * (time_block_until), so a device interrupt always cuts short the
+ * sleep of the core it targets.
+ */
+unsigned long uk_intctlr_pending_events[CONFIG_UKPLAT_CPU_MAXCOUNT];
 
 UK_TRACEPOINT(trace_uk_intctlr_unhandled_irq, "Unhandled irq=%lu\n",
 	      unsigned long);
@@ -162,7 +171,9 @@ void uk_intctlr_irq_handle(struct uk_lcpu_except_irq_ctx *ctx)
 		if (irq_handlers[irq][i].func == NULL)
 			break;
 		h = &irq_handlers[irq][i];
-		if (irq != ukplat_time_get_irq())
+		if (irq != ukplat_time_get_irq()) {
+			__u64 cpu_idx;
+
 			/* ukplat_time_get_irq() gives the IRQ reserved for a timer,
 			 * responsible to wake up cpu from halt, so it can check if
 			 * it has something to do. Effectively it is OS ticks.
@@ -174,6 +185,18 @@ void uk_intctlr_irq_handle(struct uk_lcpu_except_irq_ctx *ctx)
 			 * that work.
 			 */
 			uk_or_relax(&sched_have_pending_events, 1);
+
+			/*
+			 * Also flag the current CPU. The shared flag
+			 * above is one slot for all CPUs, so another
+			 * core's halting loop can consume it before
+			 * this core wakes. The per-CPU flag cuts
+			 * short only this core's sleep.
+			 */
+			cpu_idx = uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx);
+			if (cpu_idx < CONFIG_UKPLAT_CPU_MAXCOUNT)
+				uk_or_relax(&uk_intctlr_pending_events[cpu_idx], 1);
+		}
 
 		if (h->func(h->arg) == 1)
 			return;

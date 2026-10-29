@@ -300,6 +300,56 @@ static struct pci_bus_handler ph __unused;
 
 struct pci_driver *pci_find_driver(struct pci_device_id *id);
 
+/*
+ * Configuration space access for x86_64. The implementation uses the
+ * CF8/CFC port pair and lives in
+ * drivers/ukbus/pci/arch/x86_64/pci_bus.c. Drivers must call these
+ * functions instead of repeating the port I/O sequence.
+ */
+
+/**
+ * Read one word from PCI configuration space.
+ *
+ * @param addr
+ *  The address of the function on the bus.
+ * @param offset
+ *  Byte offset into configuration space. The access is aligned down
+ *  to a 4-byte boundary, like every CF8/CFC access.
+ * @return
+ *  The 32-bit word at the aligned offset. A missing device reads
+ *  back as 0xFFFFFFFF.
+ */
+__u32 uk_pci_read_config32(const struct pci_address *addr, __u8 offset);
+
+/**
+ * Write one word to PCI configuration space.
+ *
+ * @param addr
+ *  The address of the function on the bus.
+ * @param offset
+ *  Byte offset into configuration space. The access is aligned down
+ *  to a 4-byte boundary, like every CF8/CFC access.
+ * @param value
+ *  The 32-bit word to store.
+ */
+void uk_pci_write_config32(const struct pci_address *addr, __u8 offset,
+			   __u32 value);
+
+/**
+ * Resolve the bus address encoded in a Base Address Register.
+ *
+ * @param addr
+ *  The address of the function on the bus.
+ * @param bar
+ *  Byte offset of the register: PCI_BASE_ADDRESS_0 through
+ *  PCI_BASE_ADDRESS_5.
+ * @return
+ *  The decoded address. For an I/O space register this is the port
+ *  number. For a 64-bit memory register the two halves are joined.
+ *  A disabled register returns 0.
+ */
+__u64 uk_pci_read_bar(const struct pci_address *addr, __u8 bar);
+
 #ifdef __cplusplus
 }
 #endif

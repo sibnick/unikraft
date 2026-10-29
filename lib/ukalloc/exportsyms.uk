@@ -19,6 +19,9 @@ uk_alloc_pmaxalloc_compat
 uk_alloc_pavailmem_compat
 uk_alloc_availmem_total
 uk_alloc_pavailmem_total
+uk_alloc_get_current
+uk_alloc_canary_check
+uk_pcpuvar_percore_alloc
 _uk_alloc_head
 uk_alloc_stats_get
 _uk_alloc_stats_global

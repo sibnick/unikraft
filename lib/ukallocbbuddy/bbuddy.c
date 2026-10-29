@@ -82,7 +82,30 @@ struct uk_bbpalloc {
 	unsigned long nr_free_pages;
 	struct uk_hlist_head free_head[FREELIST_SIZE];
 	struct uk_bbpalloc_memr *memr_head;
+	/* Set for an allocator shared between cores. The default heap is
+	 * used by every core (posix-socket, posix-poll, lwIP mailboxes).
+	 * bbuddy is not thread-safe without this guard: concurrent
+	 * malloc/free corrupts the free lists. [Ticket d4c2a6bd2a] */
+	unsigned int shared;
+	unsigned int lock;
 };
+
+static inline void bbuddy_lock(struct uk_bbpalloc *b)
+{
+	unsigned int exp;
+
+	if (!b->shared)
+		return;
+	exp = 0;
+	while (!uk_compare_exchange_n(&b->lock, &exp, 1u))
+		exp = 0;
+}
+
+static inline void bbuddy_unlock(struct uk_bbpalloc *b)
+{
+	if (b->shared)
+		uk_exchange_n(&b->lock, 0u);
+}
 
 #if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
 /* Provide sanity checking of freelists, walking their length and checking
@@ -117,11 +140,11 @@ do {									\
 			uk_pr_err("Bad page level" _FREESAN_LOCFMT	\
 				  "got %u, expected %zu\n",		\
 				  c, (ord), (head), off, c->page_order, (ord));\
-		if (c->link.pprev && (*c->link.pprev)->next != &c->link) \
+		if (!c->link.pprev || *c->link.pprev != &c->link) \
 			uk_pr_err("Bad backlink" _FREESAN_LOCFMT	\
 				  "got %p, expected %p\n",		\
 				  c, (ord), (head), off,		\
-				  (*c->link.pprev)->next, &c->link);	\
+				  c->link.pprev ? *c->link.pprev : NULL, &c->link);	\
 	}								\
 } while (0)
 
@@ -356,7 +379,7 @@ static inline void bbuddy_trim(struct uk_bbpalloc *b, struct chunk_head *ch,
 	}
 }
 
-static void *bbuddy_palloc(struct uk_alloc *a, unsigned long num_pages)
+static void *bbuddy_palloc_nolock(struct uk_alloc *a, unsigned long num_pages)
 {
 	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
 	struct chunk_head *alloc_ch;
@@ -398,6 +421,17 @@ err_nomem:
 	uk_alloc_stats_count_penomem(a, num_pages);
 	errno = ENOMEM;
 	return NULL;
+}
+
+static void *bbuddy_palloc(struct uk_alloc *a, unsigned long num_pages)
+{
+	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
+	void *obj;
+
+	bbuddy_lock(b);
+	obj = bbuddy_palloc_nolock(a, num_pages);
+	bbuddy_unlock(b);
+	return obj;
 }
 
 /**
@@ -460,7 +494,8 @@ static inline size_t bbuddy_merge(struct uk_bbpalloc *b,
 	return ord;
 }
 
-static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
+static void bbuddy_pfree_nolock(struct uk_alloc *a, void *obj,
+			       unsigned long num_pages)
 {
 	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
 	char *base = obj;
@@ -472,6 +507,49 @@ static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
 	UK_ASSERT(obj);
 	UK_ASSERT(num_pages);
 	UK_ASSERT(IS_ALIGNED((uintptr_t)obj, __PAGE_SIZE));
+
+#if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
+	/* Free-path guard. Catch a double free or a bad-size free before it
+	 * corrupts the allocator, name the object and size, and print the
+	 * freeing call chain. A bad size here means the caller's size
+	 * bookkeeping, or the pointer itself, was corrupted by an earlier
+	 * write. This is the fault that shows up later as a map_free
+	 * region-overrun assert. [Ticket a9c6945c21] */
+	{
+		struct uk_bbpalloc_memr *gm = map_get_memr(b, (uintptr_t)obj);
+		unsigned long end = (uintptr_t)obj + (num_pages << __PAGE_SHIFT);
+		unsigned long rend = gm ? gm->first_page +
+			(gm->nr_pages << __PAGE_SHIFT) : 0;
+		int bad = 0;
+
+		if (!allocated_in_map(b, (uintptr_t)obj)) {
+			uk_pr_err("bbuddy guard: free of unallocated or wild obj=%p num_pages=%lu\n",
+				  obj, num_pages);
+			bad = 1;
+		} else if (!gm || end > rend) {
+			uk_pr_err("bbuddy guard: bad-size free obj=%p num_pages=%lu region=[%p,%p)\n",
+				  obj, num_pages,
+				  (void *)(gm ? gm->first_page : 0), (void *)rend);
+			bad = 1;
+		}
+		if (bad) {
+			unsigned long *fp = __builtin_frame_address(0);
+			int i;
+
+			for (i = 0; i < 12 && fp; i++) {
+				unsigned long ra;
+
+				if (((uintptr_t)fp & (sizeof(long) - 1)) != 0)
+					break;
+				ra = fp[1];
+				if (!ra)
+					break;
+				uk_pr_err("bbuddy guard:   #%d ra=0x%lx\n", i, ra);
+				fp = (unsigned long *)fp[0];
+			}
+		}
+	}
+#endif
 
 	uk_alloc_stats_count_pfree(a, obj, num_pages);
 	freelist_sanitycheck(b->free_head);
@@ -505,6 +583,16 @@ static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
 	freelist_sanitycheck(b->free_head);
 }
 
+static void bbuddy_pfree(struct uk_alloc *a, void *obj,
+			unsigned long num_pages)
+{
+	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
+
+	bbuddy_lock(b);
+	bbuddy_pfree_nolock(a, obj, num_pages);
+	bbuddy_unlock(b);
+}
+
 static long bbuddy_pmaxalloc(struct uk_alloc *a)
 {
 	struct uk_bbpalloc *b;
@@ -535,7 +623,7 @@ static long bbuddy_pavailmem(struct uk_alloc *a)
 	return (long) b->nr_free_pages;
 }
 
-static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
+static int bbuddy_addmem_nolock(struct uk_alloc *a, void *base, size_t len)
 {
 	struct uk_bbpalloc *b;
 	struct uk_bbpalloc_memr *memr;
@@ -633,7 +721,20 @@ static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
 	return 0;
 }
 
-struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
+static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
+{
+	struct uk_bbpalloc *b;
+	int ret;
+
+	b = (struct uk_bbpalloc *)&a->priv;
+	bbuddy_lock(b);
+	ret = bbuddy_addmem_nolock(a, base, len);
+	bbuddy_unlock(b);
+	return ret;
+}
+
+static struct uk_alloc *bbuddy_init(void *base, size_t len,
+				   unsigned int shared)
 {
 	struct uk_alloc *a;
 	struct uk_bbpalloc *b;
@@ -665,6 +766,8 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
 	for (i = 0; i < FREELIST_SIZE; i++)
 		UK_INIT_HLIST_HEAD(&b->free_head[i]);
 	b->memr_head = NULL;
+	b->shared = shared;
+	b->lock = 0;
 
 	/* initialize and register allocator interface */
 	uk_alloc_init_palloc(a, bbuddy_palloc, bbuddy_pfree,
@@ -677,4 +780,14 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
 				 (size_t)(max - min));
 
 	return a;
+}
+
+struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
+{
+	return bbuddy_init(base, len, 0);
+}
+
+struct uk_alloc *uk_allocbbuddy_init_shared(void *base, size_t len)
+{
+	return bbuddy_init(base, len, 1);
 }

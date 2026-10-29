@@ -654,67 +654,67 @@ __isr __uptr uk_plat_native_except_get_except_stack_base(void)
 }
 
 #if CONFIG_HAVE_SMP
-static inline int x2apic_enable(void)
+static int apic_is_x2apic;
+static __u64 apic_base_addr;
+
+/*
+ * Force the local APIC into xAPIC (MMIO) mode. The EXTD bit (19)
+ * of the APIC base MSR stays clear, so the x2APIC TSC-deadline
+ * timer is never used: secondary cores rely on the xAPIC one-shot
+ * timer for waking from hlt.
+ */
+static inline int apic_enable(void)
 {
-	__u32 eax, ebx, ecx, edx;
+	__u32 eax, edx;
 
-	/* Check for x2APIC support */
-	uk_arch_x86_64_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
-	if (!(ecx & UK_ARCH_X86_64_CPUID1_ECX_X2APIC))
-		return -ENOTSUP;
+	uk_arch_x86_64_rdmsr(UK_ARCH_X86_64_APIC_MSR_BASE, &eax, &edx);
 
-	/* Check if APIC is active */
-	uk_arch_x86_64_rdmsr(UK_ARCH_X86_64_APIC_MSR_BASE,
-			     &eax, &edx);
-	if (!(eax & UK_ARCH_X86_64_APIC_BASE_EN))
-		return -ENOTSUP;
+	/* MMIO base is bits 35:12 of the base MSR; default is 0xFEE00000 */
+	apic_base_addr = (((__u64)edx << 32) | (__u64)eax) & 0xFFFFF000UL;
+	if (!apic_base_addr)
+		apic_base_addr = 0xFEE00000UL;
 
-	/* Switch to x2APIC mode */
-	eax |= UK_ARCH_X86_64_APIC_BASE_EXTD;
-	uk_arch_x86_64_wrmsr(UK_ARCH_X86_64_APIC_MSR_BASE,
-			     eax, edx);
-
-	/* Set APIC software enable flag if necessary */
-	uk_arch_x86_64_rdmsr(UK_ARCH_X86_64_APIC_MSR_SVR,
-					    &eax, &edx);
-	if ((eax & UK_ARCH_X86_64_APIC_SVR_EN) == 0) {
-		eax |= UK_ARCH_X86_64_APIC_SVR_EN;
-		uk_arch_x86_64_wrmsr(UK_ARCH_X86_64_APIC_MSR_SVR,
-				     eax, edx);
-	}
+	/* Set the xAPIC enable (bit 11), clear the x2APIC enable (bit 10) */
+	eax |= UK_ARCH_X86_64_APIC_BASE_EN;
+	eax &= ~UK_ARCH_X86_64_APIC_BASE_EXTD;
+	uk_arch_x86_64_wrmsr(UK_ARCH_X86_64_APIC_MSR_BASE, eax, edx);
 
 	/*
-	 * TODO: Configure spurious interrupt vector number
-	 * After power-up or reset this is 0xff, which might not be
-	 * configured in the trap table
+	 * Software enable: set the enable bit (0x100) and the spurious
+	 * vector in the SVR register at offset 0xF0.
 	 */
+	volatile __u32 *svr = (volatile __u32 *)(apic_base_addr + 0xF0);
 
+	*svr = (*svr) | 0x100 | 0xFF;
+
+	apic_is_x2apic = 0;
 	return 0;
 }
 
-static inline void x2apic_send_ipi(__u32 irqno, __u64 dest)
+static inline void apic_send_ipi(__u32 irqno, __u64 dest)
 {
-	__u32 eax;
+	volatile __u32 *icr_lo = (volatile __u32 *)(apic_base_addr + 0x300);
+	__u32 vector = (32 + irqno) & 0xff;
 
-	UK_ASSERT(((32 + irqno) & 0xff) == (32 + irqno));
-
-	eax = UK_ARCH_X86_64_APIC_ICR_TRIGGER_LEVEL |
-	      UK_ARCH_X86_64_APIC_ICR_LEVEL_ASSERT |
-	      UK_ARCH_X86_64_APIC_ICR_DESTMODE_PHYSICAL |
-	      UK_ARCH_X86_64_APIC_ICR_DMODE_FIXED | (32 + irqno);
-
-	uk_arch_x86_64_wrmsr(UK_ARCH_X86_64_APIC_MSR_ICR, eax, dest);
+	/*
+	 * xAPIC physical IPI: the destination APIC ID goes into bits
+	 * 28:24 of ICR-low, with fixed delivery (bits 15:8 = 0) and
+	 * edge trigger (bit 10 = 0), and with no level or self bit.
+	 * ICR-high (0x310) only applies in x2APIC mode, and 0x4000 in
+	 * ICR-low is the SELF-IPI flag: the old code wrote the
+	 * destination to ICR-high and set the self bit, so it only
+	 * ever posted the IPI to the sender itself.
+	 * [Ticket aa0fc35743]
+	 */
+	*icr_lo = (vector & 0xffU) | ((__u32)(dest & 0xffU) << 24);
 }
-
-#define apic_enable		x2apic_enable
-#define apic_send_ipi		x2apic_send_ipi
 
 int uk_plat_native_except_send_ipi(__u64 id, __u32 irq)
 {
 	apic_send_ipi(irq, id);
 	return 0;
 }
-#endif /* CONFIG_HAVE_SMP */
+
 
 __isr int uk_plat_native_except_init(void)
 {
@@ -730,3 +730,4 @@ __isr int uk_plat_native_except_init(void)
 
 	return 0;
 }
+#endif /* CONFIG_HAVE_SMP */
