@@ -61,13 +61,13 @@ struct chunk_head {
 	unsigned int page_order;
 };
 
-#define CHUNK_END(buf, ord) \
+#define CHUNK_END(buf, ord)                                                    \
 	((void *)(((char *)(buf)) + (1ULL << ((ord) + __PAGE_SHIFT))))
 
 /* Linked lists of free chunks of different powers-of-two in size. */
 #define FREELIST_SIZE ((sizeof(void *) << 3) - __PAGE_SHIFT)
 #define FREELIST_EMPTY(_l) uk_hlist_empty((_l))
-#define FREELIST_ALIGNED(ptr, lvl) \
+#define FREELIST_ALIGNED(ptr, lvl)                                             \
 	!((uintptr_t)(ptr) & ((1ULL << ((lvl) + __PAGE_SHIFT)) - 1))
 
 /* keep a bitmap for each memory region separately */
@@ -123,47 +123,56 @@ static inline void bbuddy_unlock(struct uk_bbpalloc *b, unsigned long flags)
 
 #include <uk/paging.h>
 #define _FREESAN_NONCANON(x) ((x) && (~(uintptr_t)(x)))
-#define _FREESAN_BAD_CHUNKPTR(x) \
-	(((uintptr_t)x & (sizeof(void *) - 1)) || \
-	_FREESAN_NONCANON((uintptr_t)(x) >> \
-	UK_PAGING_PAGE_Lx_SHIFT(UK_PAGING_PT_LEVELS - 1)))
+#define _FREESAN_BAD_CHUNKPTR(x)                                               \
+	(((uintptr_t)x & (sizeof(void *) - 1)) ||                              \
+	 _FREESAN_NONCANON((uintptr_t)(x) >>                                   \
+			   UK_PAGING_PAGE_Lx_SHIFT(UK_PAGING_PT_LEVELS - 1)))
 
 #define _FREESAN_LOCFMT "\t@ %p (free_head[%zu](%p) + %zu): "
 
-#define _FREESAN_HEAD(head, ord)					\
-do {									\
-	size_t off = 0;							\
-	struct chunk_head *c;						\
-									\
-	uk_hlist_for_each_entry(c, (head), link) {			\
-		if (_FREESAN_BAD_CHUNKPTR(c)) {				\
-			uk_pr_err("Invalid chunk pointer" _FREESAN_LOCFMT "\n",\
-				  c, (ord), (head), off);		\
-			break;						\
-		}							\
-		if (!FREELIST_ALIGNED(c, (ord)))			\
-			uk_pr_err("Unaligned chunk" _FREESAN_LOCFMT	\
-				  "%p not aligned to %llx boundary\n",	\
-				  c, (ord), (head), off, c, BBUDDY_LEN((ord)));\
-		if (c->page_order != (ord))				\
-			uk_pr_err("Bad page level" _FREESAN_LOCFMT	\
-				  "got %u, expected %zu\n",		\
-				  c, (ord), (head), off, c->page_order, (ord));\
-		if (c->link.pprev && (*c->link.pprev)->next != &c->link) \
-			uk_pr_err("Bad backlink" _FREESAN_LOCFMT	\
-				  "got %p, expected %p\n",		\
-				  c, (ord), (head), off,		\
-				  (*c->link.pprev)->next, &c->link);	\
-	}								\
-} while (0)
+#define _FREESAN_HEAD(head, ord)                                               \
+	do {                                                                   \
+		size_t off = 0;                                                \
+		struct chunk_head *c;                                          \
+                                                                               \
+		uk_hlist_for_each_entry(c, (head), link)                       \
+		{                                                              \
+			if (_FREESAN_BAD_CHUNKPTR(c)) {                        \
+				uk_pr_err(                                     \
+				    "Invalid chunk pointer" _FREESAN_LOCFMT    \
+				    "\n",                                      \
+				    c, (ord), (head), off);                    \
+				break;                                         \
+			}                                                      \
+			if (!FREELIST_ALIGNED(c, (ord)))                       \
+				uk_pr_err("Unaligned chunk" _FREESAN_LOCFMT    \
+					  "%p not aligned to %llx boundary\n", \
+					  c, (ord), (head), off, c,            \
+					  BBUDDY_LEN((ord)));                  \
+			if (c->page_order != (ord))                            \
+				uk_pr_err("Bad page level" _FREESAN_LOCFMT     \
+					  "got %u, expected %zu\n",            \
+					  c, (ord), (head), off,               \
+					  c->page_order, (ord));               \
+			if (!c->link.pprev || *c->link.pprev != &c->link)      \
+				uk_pr_err("Bad backlink" _FREESAN_LOCFMT       \
+					  "got %p, expected %p\n",             \
+					  c, (ord), (head), off,               \
+					  c->link.pprev ? *c->link.pprev       \
+							: NULL,                \
+					  &c->link);                           \
+		}                                                              \
+	} while (0)
 
-#define freelist_sanitycheck(free_head)					\
-for (size_t i = 0; i < FREELIST_SIZE; i++)				\
+#define freelist_sanitycheck(free_head)                                        \
+	for (size_t i = 0; i < FREELIST_SIZE; i++)                             \
 	_FREESAN_HEAD(&(free_head)[i], i)
 
 #else /* !CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY */
 
-#define freelist_sanitycheck(x) do {} while (0)
+#define freelist_sanitycheck(x)                                                \
+	do {                                                                   \
+	} while (0)
 
 #endif /* CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY */
 
@@ -178,9 +187,9 @@ for (size_t i = 0; i < FREELIST_SIZE; i++)				\
  *  *_idx == Index into `mm_alloc_bitmap' array.
  *  *_off == Bit offset within an element of the `mm_alloc_bitmap' array.
  */
-#define BITS_PER_BYTE       8
-#define BYTES_PER_MAPWORD   (sizeof(unsigned long))
-#define PAGES_PER_MAPWORD   (BYTES_PER_MAPWORD * BITS_PER_BYTE)
+#define BITS_PER_BYTE 8
+#define BYTES_PER_MAPWORD (sizeof(unsigned long))
+#define PAGES_PER_MAPWORD (BYTES_PER_MAPWORD * BITS_PER_BYTE)
 
 static inline struct uk_bbpalloc_memr *map_get_memr(struct uk_bbpalloc *b,
 						    unsigned long page_va)
@@ -192,12 +201,11 @@ static inline struct uk_bbpalloc_memr *map_get_memr(struct uk_bbpalloc *b,
 	 * This is a linear search but it is expected that we have only a few
 	 * of them. It should be just one region in most cases
 	 */
-	for (memr = b->memr_head; memr != NULL; memr = memr->next) {
-		if ((page_va >= memr->first_page)
-		    && (page_va < (memr->first_page +
-		    (memr->nr_pages << __PAGE_SHIFT))))
+	for (memr = b->memr_head; memr != NULL; memr = memr->next)
+		if ((page_va >= memr->first_page) &&
+		    (page_va <
+		     (memr->first_page + (memr->nr_pages << __PAGE_SHIFT))))
 			return memr;
-	}
 
 	/*
 	 * No region found
@@ -206,7 +214,7 @@ static inline struct uk_bbpalloc_memr *map_get_memr(struct uk_bbpalloc *b,
 }
 
 static inline unsigned long allocated_in_map(struct uk_bbpalloc *b,
-				   unsigned long page_va)
+					     unsigned long page_va)
 {
 	struct uk_bbpalloc_memr *memr = map_get_memr(b, page_va);
 	unsigned long page_idx;
@@ -237,8 +245,8 @@ static void map_alloc(struct uk_bbpalloc *b, uintptr_t first_page,
 	 */
 	memr = map_get_memr(b, first_page);
 	UK_ASSERT(memr != NULL);
-	UK_ASSERT((first_page + (nr_pages << __PAGE_SHIFT))
-		  <= (memr->first_page + (memr->nr_pages << __PAGE_SHIFT)));
+	UK_ASSERT((first_page + (nr_pages << __PAGE_SHIFT)) <=
+		  (memr->first_page + (memr->nr_pages << __PAGE_SHIFT)));
 
 	first_page -= memr->first_page;
 	first_page_idx = first_page >> __PAGE_SHIFT;
@@ -275,8 +283,8 @@ static void map_free(struct uk_bbpalloc *b, uintptr_t first_page,
 	 */
 	memr = map_get_memr(b, first_page);
 	UK_ASSERT(memr != NULL);
-	UK_ASSERT((first_page + (nr_pages << __PAGE_SHIFT))
-		  <= (memr->first_page + (memr->nr_pages << __PAGE_SHIFT)));
+	UK_ASSERT((first_page + (nr_pages << __PAGE_SHIFT)) <=
+		  (memr->first_page + (memr->nr_pages << __PAGE_SHIFT)));
 
 	first_page -= memr->first_page;
 	first_page_idx = first_page >> __PAGE_SHIFT;
@@ -306,7 +314,7 @@ static void map_free(struct uk_bbpalloc *b, uintptr_t first_page,
 #define BBUDDY_LEN(ord) (BBUDDY_PAGES((ord)) << __PAGE_SHIFT)
 
 /* Address of buddy page of `ptr` at page order `ord` */
-#define BBUDDY_BUDDY_ADDR(ptr, ord) \
+#define BBUDDY_BUDDY_ADDR(ptr, ord)                                            \
 	((void *)(((uintptr_t)(ptr)) ^ BBUDDY_LEN(ord)))
 
 /* Non-zero if `ptr` would be the head buddy in page order `ord` */
@@ -407,8 +415,8 @@ static void *bbuddy_palloc_nolock(struct uk_alloc *a, unsigned long num_pages)
 		goto err_nomem;
 
 	/* Grab & unlink a chunk */
-	alloc_ch = uk_hlist_entry(b->free_head[ord].first, struct chunk_head,
-				  link);
+	alloc_ch =
+	    uk_hlist_entry(b->free_head[ord].first, struct chunk_head, link);
 	uk_hlist_del(&alloc_ch->link);
 	UK_ASSERT(FREELIST_ALIGNED(alloc_ch, ord));
 
@@ -418,7 +426,7 @@ static void *bbuddy_palloc_nolock(struct uk_alloc *a, unsigned long num_pages)
 	/* Mark as in use and return */
 	map_alloc(b, (uintptr_t)alloc_ch, num_pages);
 
-	uk_alloc_stats_count_palloc(a, (void *) alloc_ch, num_pages);
+	uk_alloc_stats_count_palloc(a, (void *)alloc_ch, num_pages);
 	freelist_sanitycheck(b->free_head);
 
 	return (void *)alloc_ch;
@@ -505,7 +513,7 @@ static inline size_t bbuddy_merge(struct uk_bbpalloc *b,
 }
 
 static void bbuddy_pfree_nolock(struct uk_alloc *a, void *obj,
-			       unsigned long num_pages)
+				unsigned long num_pages)
 {
 	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
 	char *base = obj;
@@ -550,8 +558,7 @@ static void bbuddy_pfree_nolock(struct uk_alloc *a, void *obj,
 	freelist_sanitycheck(b->free_head);
 }
 
-static void bbuddy_pfree(struct uk_alloc *a, void *obj,
-			unsigned long num_pages)
+static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
 {
 	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
 	unsigned long flags;
@@ -571,14 +578,13 @@ static long bbuddy_pmaxalloc_nolock(struct uk_alloc *a)
 
 	/* Find biggest order that has still elements available */
 	order = FREELIST_SIZE;
-	for (i = 0; i < FREELIST_SIZE; i++) {
+	for (i = 0; i < FREELIST_SIZE; i++)
 		if (!FREELIST_EMPTY(&b->free_head[i]))
 			order = i;
-	}
 	if (order == FREELIST_SIZE)
 		return 0; /* no memory left */
 
-	return (long) (1 << order);
+	return (long)(1 << order);
 }
 
 static long bbuddy_pmaxalloc(struct uk_alloc *a)
@@ -609,7 +615,7 @@ static long bbuddy_pavailmem(struct uk_alloc *a)
 	 * under the lock so the answer cannot be a torn update.
 	 * [Ticket 5bec1639dc] */
 	flags = bbuddy_lock(b);
-	ret = (long) b->nr_free_pages;
+	ret = (long)b->nr_free_pages;
 	bbuddy_unlock(b, flags);
 
 	return ret;
@@ -633,9 +639,12 @@ static int bbuddy_addmem_nolock(struct uk_alloc *a, void *base, size_t len)
 	min = UK_PAGING_PAGE_ALIGN_UP((uintptr_t)base);
 	max = UK_PAGING_PAGE_ALIGN_DOWN((uintptr_t)base + (uintptr_t)len);
 	if (max < min) {
-		uk_pr_err("%"__PRIuptr": Failed to add memory region %"__PRIuptr"-%"__PRIuptr": Invalid range after applying page alignments\n",
-			  (uintptr_t) a, (uintptr_t) base,
-			  (uintptr_t) base + (uintptr_t) len);
+		uk_pr_err("%"__PRIuptr
+			  ": Failed to add memory region %"__PRIuptr
+			  "-%"__PRIuptr
+			  ": Invalid range after applying page alignments\n",
+			  (uintptr_t)a, (uintptr_t)base,
+			  (uintptr_t)base + (uintptr_t)len);
 		return -EINVAL;
 	}
 
@@ -646,9 +655,12 @@ static int bbuddy_addmem_nolock(struct uk_alloc *a, void *base, size_t len)
 	 */
 	if (range < UK_PAGING_PAGE_ALIGN_UP(sizeof(*memr) + BYTES_PER_MAPWORD) +
 			__PAGE_SIZE) {
-		uk_pr_err("%"__PRIuptr": Failed to add memory region %"__PRIuptr"-%"__PRIuptr": Not enough space after applying page alignments\n",
-			  (uintptr_t) a, (uintptr_t) base,
-			  (uintptr_t) base + (uintptr_t) len);
+		uk_pr_err("%"__PRIuptr
+			  ": Failed to add memory region %"__PRIuptr
+			  "-%"__PRIuptr
+			  ": Not enough space after applying page alignments\n",
+			  (uintptr_t)a, (uintptr_t)base,
+			  (uintptr_t)base + (uintptr_t)len);
 		return -EINVAL;
 	}
 
@@ -663,9 +675,9 @@ static int bbuddy_addmem_nolock(struct uk_alloc *a, void *base, size_t len)
 	 *
 	 */
 	memr->nr_pages = range >> __PAGE_SHIFT;
-	memr->mm_alloc_bitmap = (unsigned long *) (min + sizeof(*memr));
-	memr_size = UK_PAGING_PAGE_ALIGN_UP(sizeof(*memr) +
-		DIV_ROUND_UP(memr->nr_pages, BITS_PER_BYTE));
+	memr->mm_alloc_bitmap = (unsigned long *)(min + sizeof(*memr));
+	memr_size = UK_PAGING_PAGE_ALIGN_UP(
+	    sizeof(*memr) + DIV_ROUND_UP(memr->nr_pages, BITS_PER_BYTE));
 	memr->mm_alloc_bitmap_size = memr_size - sizeof(*memr);
 
 	min += memr_size;
@@ -681,8 +693,8 @@ static int bbuddy_addmem_nolock(struct uk_alloc *a, void *base, size_t len)
 	b->memr_head = memr;
 
 	/* All allocated by default. */
-	memset(memr->mm_alloc_bitmap, (unsigned char) ~0,
-			memr->mm_alloc_bitmap_size);
+	memset(memr->mm_alloc_bitmap, (unsigned char)~0,
+	       memr->mm_alloc_bitmap_size);
 
 	/* free up the memory we've been given to play with */
 	map_free(b, min, memr->nr_pages);
@@ -696,7 +708,10 @@ static int bbuddy_addmem_nolock(struct uk_alloc *a, void *base, size_t len)
 			if (min & (1UL << i))
 				break;
 
-		uk_pr_debug("%"__PRIuptr": Add allocate unit %"__PRIuptr" - %"__PRIuptr" (order %lu)\n",
+		uk_pr_debug("%"__PRIuptr
+			    ": Add allocate unit %"__PRIuptr
+			    " - %"__PRIuptr
+			    " (order %lu)\n",
 			    (uintptr_t)a, min, (uintptr_t)(min + (1UL << i)),
 			    (i - __PAGE_SHIFT));
 
@@ -743,13 +758,16 @@ static struct uk_alloc *bbuddy_init(void *base, size_t len)
 
 	/* enough space for allocator available? */
 	if (min + metalen > max) {
-		uk_pr_err("Not enough space for allocator: %"__PRIsz" B required but only %"__PRIuptr" B usable\n",
+		uk_pr_err("Not enough space for allocator: %"__PRIsz
+			  " B required but only %"__PRIuptr
+			  " B usable\n",
 			  metalen, (max - min));
 		return NULL;
 	}
 
 	a = (struct uk_alloc *)min;
-	uk_pr_info("Initialize binary buddy allocator %"__PRIuptr"\n",
+	uk_pr_info("Initialize binary buddy allocator %"__PRIuptr
+		   "\n",
 		   (uintptr_t)a);
 	min += metalen;
 	memset(a, 0, metalen);
@@ -761,14 +779,12 @@ static struct uk_alloc *bbuddy_init(void *base, size_t len)
 	b->lock = 0;
 
 	/* initialize and register allocator interface */
-	uk_alloc_init_palloc(a, bbuddy_palloc, bbuddy_pfree,
-			     bbuddy_pmaxalloc, bbuddy_pavailmem,
-			     bbuddy_addmem);
+	uk_alloc_init_palloc(a, bbuddy_palloc, bbuddy_pfree, bbuddy_pmaxalloc,
+			     bbuddy_pavailmem, bbuddy_addmem);
 
 	if (max > min)
 		/* add left memory - ignore return value */
-		bbuddy_addmem(a, (void *)(min),
-				 (size_t)(max - min));
+		bbuddy_addmem(a, (void *)(min), (size_t)(max - min));
 
 	return a;
 }
