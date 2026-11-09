@@ -1,2 +1,4 @@
 uk_intctlr_probe
 uk_intctlr_xpic_handle_irq
+uk_intctlr_msix_alloc
+uk_intctlr_msix_free
