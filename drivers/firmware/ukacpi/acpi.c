@@ -249,7 +249,23 @@ int uk_acpi_init(void)
 #if CONFIG_LIBUKBOOT
 static int boot_acpi_init(struct ukplat_bootinfo *bi __unused)
 {
-	return uk_acpi_init();
+	int rc;
+
+	rc = uk_acpi_init();
+	if (unlikely(rc == -ENOENT)) {
+		/*
+		 * UEFI boot loaders (for example GRUB in EFI mode) do not
+		 * publish the legacy ACPI RSDP. Boot without ACPI tables
+		 * instead of failing the early init call. The x86_64 CPU
+		 * id map has an identity fallback for this case.
+		 * [Ticket 3dc1f3f6b6]
+		 */
+		uk_pr_warn("No ACPI RSDP present: booting without ACPI tables\n");
+
+		return 0;
+	}
+
+	return rc;
 }
 
 UK_BOOT_EARLYTAB_ENTRY(boot_acpi_init, UK_ACPI_INIT_PRIO);

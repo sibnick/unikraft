@@ -86,9 +86,18 @@ void pic_ack_irq(unsigned int irq)
 	uk_arch_x86_64_outb(PIC1_COMMAND, PIC_EOI);
 }
 
+/*
+ * The 8259 only decodes irq 0..15 (master 0..7, slave 8..15).
+ * Higher irq numbers are APIC-only (IPIs, extensions,
+ * MSI-X vectors) and their masking lives elsewhere (for MSI-X, the
+ * device PBA). Such irqs must not touch the 8259.
+ */
 static void pic_mask_irq(unsigned int irq)
 {
 	__u16 port;
+
+	if (irq >= 16)
+		return;
 
 	port = IRQ_PORT(irq);
 	uk_arch_x86_64_outb(port, uk_arch_x86_64_inb(port) | (1 << IRQ_OFFSET(irq)));
@@ -97,6 +106,9 @@ static void pic_mask_irq(unsigned int irq)
 static void pic_clear_irq(unsigned int irq)
 {
 	__u16 port;
+
+	if (irq >= 16)
+		return;
 
 	port = IRQ_PORT(irq);
 	uk_arch_x86_64_outb(port, uk_arch_x86_64_inb(port) & ~(1 << IRQ_OFFSET(irq)));

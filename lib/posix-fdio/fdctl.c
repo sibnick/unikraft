@@ -35,7 +35,6 @@ int uk_sys_ioctl(struct uk_ofile *of, int cmd, void *arg)
 			uk_or(&of->mode, O_NONBLOCK);
 		else
 			uk_and(&of->mode, ~O_NONBLOCK);
-		return 0;
 	}
 
 	iolock = _SHOULD_LOCK(of->mode);

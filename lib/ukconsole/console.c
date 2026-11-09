@@ -7,6 +7,7 @@
 #include <uk/essentials.h>
 #include <uk/alloc.h>
 #include <uk/arch/types.h>
+#include <uk/arch/spinlock.h>
 #include <uk/bitops/bitmap.h>
 #include <uk/list.h>
 #include <uk/console.h>
@@ -59,15 +60,32 @@ __u16 uk_console_count(void)
 	return count;
 }
 
+/*
+ * Serializes the two console write paths: app printf reaches here through
+ * devfs, and kernel uk_printk reaches it through libukprint. On an SMP
+ * guest the cores write COM1 at the same time. Without this lock the
+ * messages interleave byte for byte, and the run scripts cannot read
+ * their gate markers or a crash dump. [Ticket 3dc1f3f6b6]
+ *
+ * The lock is taken with interrupts off. A handler that prints on a core
+ * that already holds the lock would otherwise spin forever. [Ticket
+ * f9d24435b8]
+ */
+static __spinlock uk_console_out_lock = UKARCH_SPINLOCK_INITIALIZER();
+
 __ssz uk_console_out(const char *buf, __sz len)
 {
 	struct uk_console *dev = __NULL;
+	unsigned long flags;
 
 	if (unlikely(!len))
 		return 0;
 
 	if (unlikely(!buf))
 		return -EINVAL;
+
+	flags = uk_lcpu_save_irqf();
+	ukarch_spin_lock(&uk_console_out_lock);
 
 	/* Output to all STDOUT devices */
 	uk_spin_lock(&cons_dev_list_lock);
@@ -77,7 +95,35 @@ __ssz uk_console_out(const char *buf, __sz len)
 	}
 	uk_spin_unlock(&cons_dev_list_lock);
 
+	ukarch_spin_unlock(&uk_console_out_lock);
+	uk_lcpu_restore_irqf(flags);
+
 	return len;
+}
+
+/*
+ * Break the console lock when a crash starts. Only the core that performs
+ * the crash dump calls this, before it prints. The function tries the lock
+ * with a short bound. If the holder does not release in time, the function
+ * assumes the holder died with the lock and forces it open. The crash dump
+ * then reaches the serial port instead of hanging silently. A live holder
+ * finishes its write and releases. Its release is one store, so it only
+ * unlocks what the crash core took. [Ticket f9d24435b8]
+ */
+#define UK_CONSOLE_BREAK_TRIES 100000u
+
+void uk_console_break_lock(void)
+{
+	unsigned int tries;
+
+	for (tries = 0; tries < UK_CONSOLE_BREAK_TRIES; tries++) {
+		if (ukarch_spin_trylock(&uk_console_out_lock)) {
+			ukarch_spin_unlock(&uk_console_out_lock);
+			return;
+		}
+		uk_arch_spinwait();
+	}
+	ukarch_spin_unlock(&uk_console_out_lock);
 }
 
 __ssz uk_console_in(char *buf, __sz len)

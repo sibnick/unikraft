@@ -50,6 +50,7 @@
 #include <uk/arch/limits.h>
 #include <uk/atomic.h>
 #include <uk/bitops/bitscan.h>
+#include <uk/lcpu.h>
 #include <uk/print.h>
 #include <uk/assert.h>
 #include <uk/list.h>
@@ -82,7 +83,38 @@ struct uk_bbpalloc {
 	unsigned long nr_free_pages;
 	struct uk_hlist_head free_head[FREELIST_SIZE];
 	struct uk_bbpalloc_memr *memr_head;
+	/* Guards the free lists. Every instance takes this lock, with
+	 * interrupts off, on every operation. The default heap is used
+	 * by every core. A per-core heap can also receive a cross-core
+	 * free: for example, one core frees a netbuf that another core
+	 * allocated. Without the lock, such use corrupts the free
+	 * lists. [Ticket d4c2a6bd2a, 5bec1639dc] */
+	unsigned int lock;
 };
+
+/*
+ * Take the allocator lock with interrupts off. The lock word guards
+ * the free lists. Turning interrupts off stops an interrupt handler
+ * on the lock holder from allocating or freeing on the same core. The
+ * return value carries the saved interrupt flags to the matching
+ * unlock. [Ticket f9d24435b8]
+ */
+static inline unsigned long bbuddy_lock(struct uk_bbpalloc *b)
+{
+	unsigned long flags = uk_lcpu_save_irqf();
+	unsigned int exp = 0;
+
+	while (!uk_compare_exchange_n(&b->lock, &exp, 1u))
+		exp = 0;
+
+	return flags;
+}
+
+static inline void bbuddy_unlock(struct uk_bbpalloc *b, unsigned long flags)
+{
+	uk_exchange_n(&b->lock, 0u);
+	uk_lcpu_restore_irqf(flags);
+}
 
 #if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
 /* Provide sanity checking of freelists, walking their length and checking
@@ -356,7 +388,7 @@ static inline void bbuddy_trim(struct uk_bbpalloc *b, struct chunk_head *ch,
 	}
 }
 
-static void *bbuddy_palloc(struct uk_alloc *a, unsigned long num_pages)
+static void *bbuddy_palloc_nolock(struct uk_alloc *a, unsigned long num_pages)
 {
 	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
 	struct chunk_head *alloc_ch;
@@ -398,6 +430,18 @@ err_nomem:
 	uk_alloc_stats_count_penomem(a, num_pages);
 	errno = ENOMEM;
 	return NULL;
+}
+
+static void *bbuddy_palloc(struct uk_alloc *a, unsigned long num_pages)
+{
+	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
+	unsigned long flags;
+	void *obj;
+
+	flags = bbuddy_lock(b);
+	obj = bbuddy_palloc_nolock(a, num_pages);
+	bbuddy_unlock(b, flags);
+	return obj;
 }
 
 /**
@@ -460,7 +504,8 @@ static inline size_t bbuddy_merge(struct uk_bbpalloc *b,
 	return ord;
 }
 
-static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
+static void bbuddy_pfree_nolock(struct uk_alloc *a, void *obj,
+			       unsigned long num_pages)
 {
 	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
 	char *base = obj;
@@ -505,7 +550,18 @@ static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
 	freelist_sanitycheck(b->free_head);
 }
 
-static long bbuddy_pmaxalloc(struct uk_alloc *a)
+static void bbuddy_pfree(struct uk_alloc *a, void *obj,
+			unsigned long num_pages)
+{
+	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
+	unsigned long flags;
+
+	flags = bbuddy_lock(b);
+	bbuddy_pfree_nolock(a, obj, num_pages);
+	bbuddy_unlock(b, flags);
+}
+
+static long bbuddy_pmaxalloc_nolock(struct uk_alloc *a)
 {
 	struct uk_bbpalloc *b;
 	size_t i, order;
@@ -525,17 +581,41 @@ static long bbuddy_pmaxalloc(struct uk_alloc *a)
 	return (long) (1 << order);
 }
 
+static long bbuddy_pmaxalloc(struct uk_alloc *a)
+{
+	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
+	unsigned long flags;
+	long ret;
+
+	/* The walk reads the free list heads. A concurrent alloc or
+	 * free updates them, so take the lock. [Ticket 5bec1639dc] */
+	flags = bbuddy_lock(b);
+	ret = bbuddy_pmaxalloc_nolock(a);
+	bbuddy_unlock(b, flags);
+
+	return ret;
+}
+
 static long bbuddy_pavailmem(struct uk_alloc *a)
 {
 	struct uk_bbpalloc *b;
+	unsigned long flags;
+	long ret;
 
 	UK_ASSERT(a != NULL);
 	b = (struct uk_bbpalloc *)&a->priv;
 
-	return (long) b->nr_free_pages;
+	/* nr_free_pages moves with every alloc and free. Read it
+	 * under the lock so the answer cannot be a torn update.
+	 * [Ticket 5bec1639dc] */
+	flags = bbuddy_lock(b);
+	ret = (long) b->nr_free_pages;
+	bbuddy_unlock(b, flags);
+
+	return ret;
 }
 
-static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
+static int bbuddy_addmem_nolock(struct uk_alloc *a, void *base, size_t len)
 {
 	struct uk_bbpalloc *b;
 	struct uk_bbpalloc_memr *memr;
@@ -633,7 +713,20 @@ static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
 	return 0;
 }
 
-struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
+static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
+{
+	struct uk_bbpalloc *b;
+	unsigned long flags;
+	int ret;
+
+	b = (struct uk_bbpalloc *)&a->priv;
+	flags = bbuddy_lock(b);
+	ret = bbuddy_addmem_nolock(a, base, len);
+	bbuddy_unlock(b, flags);
+	return ret;
+}
+
+static struct uk_alloc *bbuddy_init(void *base, size_t len)
 {
 	struct uk_alloc *a;
 	struct uk_bbpalloc *b;
@@ -665,6 +758,7 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
 	for (i = 0; i < FREELIST_SIZE; i++)
 		UK_INIT_HLIST_HEAD(&b->free_head[i]);
 	b->memr_head = NULL;
+	b->lock = 0;
 
 	/* initialize and register allocator interface */
 	uk_alloc_init_palloc(a, bbuddy_palloc, bbuddy_pfree,
@@ -677,4 +771,16 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
 				 (size_t)(max - min));
 
 	return a;
+}
+
+struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
+{
+	return bbuddy_init(base, len);
+}
+
+struct uk_alloc *uk_allocbbuddy_init_shared(void *base, size_t len)
+{
+	/* All instances lock now. Keep this entry point so existing
+	 * call sites keep building. [Ticket 5bec1639dc] */
+	return uk_allocbbuddy_init(base, len);
 }

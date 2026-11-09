@@ -42,6 +42,14 @@ extern "C" {
 
 struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len);
 
+/*
+ * Same as uk_allocbbuddy_init(). Every bbuddy instance now takes an
+ * internal lock with interrupts off on every allocation operation, so
+ * an instance may serve several cores. Keep this entry point for
+ * source compatibility. [Ticket 5bec1639dc]
+ */
+struct uk_alloc *uk_allocbbuddy_init_shared(void *base, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

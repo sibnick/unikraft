@@ -136,6 +136,8 @@ void uk_plat_native_set_auxsp(__uptr auxsp)
 	struct ukarch_auxspcb *auxspcb;
 
 	uk_pcpuvar_current_set(uk_plat_native_auxsp, auxsp);
+	if (!auxsp)
+		return;
 	auxspcb = ukarch_auxsp_get_cb(auxsp);
 	sc = (struct uk_plat_native_sysctx *)auxspcb->uksysctx;
 	sc->gsbase = rdgsbasefn();

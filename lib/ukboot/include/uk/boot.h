@@ -8,6 +8,7 @@
 
 #include <uk/config.h>
 #include <errno.h>
+#include <uk/essentials.h>
 #include <uk/plat/common/bootinfo.h>
 #include <uk/pm.h>
 
@@ -59,6 +60,28 @@ int uk_boot_shutdown_req(enum uk_pm_shutdown_op target);
 #define uk_boot_shutdown_req(target) \
 	({ -ENOTSUP; })
 #endif /* !CONFIG_LIBUKBOOT_MAINTHREAD */
+
+/**
+ * Number of per-core heap partitions carved at boot.
+ *
+ * Returns 0 when CONFIG_LIBUKBOOT_PERCORE_HEAP is disabled or
+ * when no partition could be carved.
+ */
+unsigned int uk_percore_heap_count(void);
+
+/**
+ * Get a per-core heap partition (base address and length).
+ *
+ * Partition i is the region reserved for core i + 1.
+ *
+ * @param i Partition index (0-based).
+ * @param base Output: partition base address.
+ * @param len Output: partition length in bytes.
+ * @returns
+ *   - (0): Success.
+ *   - (-EINVAL): i is out of range.
+ */
+int uk_percore_heap_get(unsigned int i, __uptr *base, __sz *len);
 
 #ifdef __cplusplus
 }

@@ -9,7 +9,11 @@
 #include <stddef.h>
 
 #include <uk/config.h>
+#include <uk/atomic.h>
 #include <uk/crash.h>
+#if defined(CONFIG_LIBUKCONSOLE) && CONFIG_LIBUKCONSOLE
+#include <uk/console.h>
+#endif /* CONFIG_LIBUKCONSOLE */
 #include <uk/essentials.h>
 #include <uk/event.h>
 #include <uk/lcpu.h>
@@ -86,10 +90,10 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
 			  struct uk_crash_descr *descr)
 {
 	struct uk_crash_event_param param;
-#if HAVE_SMP
+#if CONFIG_HAVE_SMP
 	static __s32 crash_cpu = -1;
 	int cpu_id = uk_pcpuvar_current_get(uk_pcpuvar_cpu_id);
-#endif /* HAVE_SMP */
+#endif /* CONFIG_HAVE_SMP */
 
 	UK_ASSERT(regs);
 	UK_ASSERT(descr);
@@ -98,18 +102,38 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
 	uk_preempt_disable();
 	uk_lcpu_except_push_nested();
 
-#if HAVE_SMP
-	#warning The crash code does not support multicore systems
+#if CONFIG_HAVE_SMP
+	/* Upstream guards this block with `#if HAVE_SMP`. Nothing defines
+	 * HAVE_SMP, so on an SMP build the guard was dead code: every
+	 * crashing core printed a full dump and the dumps interleaved
+	 * byte-for-byte on COM1, destroying the crash evidence. Use the
+	 * real Kconfig symbol so one core dumps and the others halt.
+	 * [Ticket 3dc1f3f6b6]
+	 */
 
-	/* Only let one CPU perform the crash */
-	if (ukarch_compare_exchange_sync(&crash_cpu, -1, cpu_id) != cpu_id) {
+	/* Only let one CPU perform the crash. The upstream call name
+	 * (ukarch_compare_exchange_sync) predates 0.21; the symbol in
+	 * this release is uk_compare_exchange_sync. [Ticket 3dc1f3f6b6]
+	 */
+	if (uk_compare_exchange_sync(&crash_cpu, -1, cpu_id) != cpu_id) {
 		/* TODO: Finish SMP Support
 		 * Freeze CPU or wait until the crash_cpu initiates a freeze
 		 * (e.g., through IPI). For now, just busy wait.
 		 */
 		uk_lcpu_halt();
 	}
-#endif /* HAVE_SMP */
+#endif /* CONFIG_HAVE_SMP */
+
+#if defined(CONFIG_LIBUKCONSOLE) && CONFIG_LIBUKCONSOLE
+	/*
+	 * A core can crash while it holds the console lock. That
+	 * includes a fault inside uk_console_out itself. Break the
+	 * lock so this dump reaches the serial port. Without this the
+	 * dump spins on the lock and the gate log never shows the
+	 * failure. [Ticket f9d24435b8]
+	 */
+	uk_console_break_lock();
+#endif /* CONFIG_LIBUKCONSOLE */
 
 #if CONFIG_LIBUKDEBUG_CRASH_SCREEN
 	crash_printk("Unikraft Crash - " STRINGIFY(UK_CODENAME)

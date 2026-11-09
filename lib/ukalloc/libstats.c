@@ -48,8 +48,19 @@
 #include <uk/essentials.h>
 #include <uk/preempt.h>
 
+#if defined(CONFIG_LIBUKPCPUVAR) && CONFIG_LIBUKPCPUVAR
+#include <uk/pcpuvar.h>
+#endif
+
 static inline struct uk_alloc *_uk_alloc_get_actual_default(void)
 {
+#if defined(CONFIG_LIBUKPCPUVAR) && CONFIG_LIBUKPCPUVAR
+	struct uk_alloc *a = uk_pcpuvar_current_get(uk_pcpuvar_percore_alloc);
+
+	if (a)
+		return a;
+#endif
+
 	return _uk_alloc_head;
 }
 

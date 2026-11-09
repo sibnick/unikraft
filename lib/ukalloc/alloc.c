@@ -41,17 +41,31 @@
 #include <uk/assert.h>
 #include <uk/arch/limits.h>
 #include <uk/lcpu.h>
+#include <uk/alloc.h>
 #include <uk/paging.h>
 
 #if CONFIG_HAVE_MEMTAG
 #include <uk/arch/memtag.h>
 #endif
 
+#if defined(CONFIG_LIBUKPCPUVAR) && CONFIG_LIBUKPCPUVAR
+#include <uk/pcpuvar.h>
+#endif /* CONFIG_LIBUKPCPUVAR */
+
 #define size_to_num_pages(size) \
 	(UK_PAGING_PAGE_ALIGN_UP((unsigned long)(size)) / __PAGE_SIZE)
 #define page_off(x) ((unsigned long)(x) & (__PAGE_SIZE - 1))
 
 struct uk_alloc *_uk_alloc_head;
+
+#if defined(CONFIG_LIBUKPCPUVAR) && CONFIG_LIBUKPCPUVAR
+/*
+ * Per-CPU slot holding a pointer to this core's standalone
+ * allocator instance. NULL means "use the default allocator".
+ * Populated at core bring-up when the per-core heap is enabled.
+ */
+struct uk_alloc * __uk_pcpuvar uk_pcpuvar_percore_alloc;
+#endif /* CONFIG_LIBUKPCPUVAR */
 
 int uk_alloc_register(struct uk_alloc *a)
 {
@@ -197,6 +211,7 @@ void uk_free_ifpages(struct uk_alloc *a, void *ptr)
 
 	UK_ASSERT(metadata->base != __NULL);
 	UK_ASSERT(metadata->num_pages != 0);
+
 	uk_pfree(a, metadata->base, metadata->num_pages);
 
 #ifdef CONFIG_HAVE_MEMTAG
@@ -628,4 +643,23 @@ unsigned long uk_alloc_pavailmem_total(void)
 			total += pavailmem;
 	}
 	return total;
+}
+
+/*
+ * Return the allocator bound to the current CPU core.
+ *
+ * Returns the per-core standalone allocator instance when one is
+ * bound to the current core (CONFIG_LIBUKBOOT_PERCORE_HEAP), and
+ * the default allocator otherwise.
+ */
+struct uk_alloc *uk_alloc_get_current(void)
+{
+#if defined(CONFIG_LIBUKPCPUVAR) && CONFIG_LIBUKPCPUVAR
+	struct uk_alloc *a = uk_pcpuvar_current_get(uk_pcpuvar_percore_alloc);
+
+	if (a)
+		return a;
+#endif /* CONFIG_LIBUKPCPUVAR */
+
+	return uk_alloc_get_default();
 }

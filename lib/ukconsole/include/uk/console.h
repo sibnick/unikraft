@@ -59,6 +59,16 @@ __u16 uk_console_count(void);
 __ssz uk_console_out(const char *buf, __sz len);
 
 /**
+ * Break the console write lock when a crash starts.
+ *
+ * Only the core that performs the crash dump calls this, before it
+ * prints. The function tries the lock with a short bound and forces it
+ * open if the holder does not release. This keeps the crash dump moving
+ * when a core died holding the lock.
+ */
+void uk_console_break_lock(void);
+
+/**
  * Read bytes from the STDIN console device(s).
  *
  * Read bytes from all devices that have the UK_CONSOLE_FLAG_STDIN

@@ -239,6 +239,13 @@ struct uk_acpi_madt *uk_acpi_get_madt(void);
  * @return 0 on success, !=0 on error.
  */
 int uk_acpi_madt_fill_cpu_idmap(void);
+
+/**
+ * Number of CPUs that the platform presents to this instance.
+ * uk_acpi_madt_fill_cpu_idmap() sets it while parsing the MADT.
+ * Without a MADT it stays at CONFIG_UKPLAT_CPU_MAXCOUNT.
+ */
+extern unsigned int uk_acpi_present_cpu_count;
 #endif /* CONFIG_LIBUKACPI_MADT_FILL_CPU_IDMAP */
 
 #ifdef __cplusplus

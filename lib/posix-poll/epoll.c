@@ -49,6 +49,8 @@ struct epoll_legacy {
 
 struct epoll_entry {
 	struct epoll_entry *next;
+	struct epoll_entry *ready_next;
+	unsigned char on_ready;
 	const struct uk_file *epf;
 #if CONFIG_LIBVFSCORE
 	int legacy;
@@ -81,12 +83,70 @@ struct epoll_alloc {
 	uk_file_refcnt frefcnt;
 	struct uk_file_state fstate;
 	struct epoll_entry *list;
+	struct epoll_entry *inbox;
+	struct epoll_entry *ready;
 };
 
 union epoll_shim_file {
 	const struct uk_file *file;
 	struct vfscore_file *vfile;
 };
+
+/* Ready-list support.
+ *
+ * The wake path must report only entries that have pending events. Two
+ * structures back this:
+ *   inbox: a lock-free Treiber stack. The poll callback pushes here.
+ *   ready: a plain list. Only the wake path and the remove path touch it,
+ *          and both hold the epoll file write lock.
+ * The on_ready flag marks an entry as reachable in one of the two. It
+ * stops an entry from being queued twice.
+ */
+
+static void epoll_ready_enqueue(struct epoll_alloc *al, struct epoll_entry *ent)
+{
+	struct epoll_entry *head;
+
+	if (uk_compare_exchange_sync(&ent->on_ready, 0, 1) != 1)
+		return;
+	do {
+		head = uk_load_n(&al->inbox);
+		ent->ready_next = head;
+	} while (!uk_compare_exchange_n(&al->inbox, &head, ent));
+}
+
+/* Move every inbox entry to the ready list. Caller holds the write lock. */
+static void epoll_ready_drain(struct epoll_alloc *al)
+{
+	struct epoll_entry *head = uk_exchange_n(&al->inbox, NULL);
+	struct epoll_entry *tail = head;
+
+	if (!head)
+		return;
+	while (tail->ready_next)
+		tail = tail->ready_next;
+	tail->ready_next = al->ready;
+	al->ready = head;
+}
+
+/* Drop ent from the ready structures. Caller holds the write lock and has
+ * unregistered ent's poll tick, so no callback can re-queue ent. */
+static void epoll_ready_remove(struct epoll_alloc *al, struct epoll_entry *ent)
+{
+	struct epoll_entry **p;
+
+	if (!uk_load_n(&ent->on_ready))
+		return;
+	epoll_ready_drain(al);
+	for (p = &al->ready; *p; p = &(*p)->ready_next) {
+		if (*p == ent) {
+			*p = ent->ready_next;
+			break;
+		}
+	}
+	uk_store_n(&ent->on_ready, 0);
+	ent->ready_next = NULL;
+}
 
 static void epoll_unregister_entry(struct epoll_entry *ent)
 {
@@ -113,8 +173,12 @@ static void epoll_event_callback(uk_pollevent set,
 		struct epoll_entry *ent = __containerof(
 			tick, struct epoll_entry, tick);
 		struct uk_pollq *upq = (struct uk_pollq *)tick->arg;
+		struct epoll_alloc *al =
+			__containerof(ent->epf, struct epoll_alloc, f);
+		uk_pollevent prev = uk_or(&ent->revents, set);
 
-		(void)uk_or(&ent->revents, set);
+		if (!prev)
+			epoll_ready_enqueue(al, ent);
 		uk_pollq_set_n(upq, UKFD_POLLIN, IS_EDGEPOLL(ent));
 		if (IS_ONESHOT(ent))
 			tick->mask = 0;
@@ -183,6 +247,7 @@ static void epoll_entry_del(const struct uk_file *epf, struct epoll_entry **p)
 
 	*p = ent->next;
 	epoll_unregister_entry(ent);
+	epoll_ready_remove(al, ent);
 	uk_free(al->alloc, ent);
 }
 
@@ -256,8 +321,12 @@ static void epoll_register(const struct uk_file *epf, struct epoll_entry *ent,
 	if (register_finalizer)
 		uk_file_finalizer_register(ent->f, &ent->fin);
 	if (ev) {
+		struct epoll_alloc *al =
+			__containerof(epf, struct epoll_alloc, f);
+
 		/* Need atomic OR since we're registered for updates */
 		(void)uk_or(&ent->revents, ev);
+		epoll_ready_enqueue(al, ent);
 		uk_pollq_set_n(&epf->state->pollq, UKFD_POLLIN, edge);
 	}
 }
@@ -277,6 +346,8 @@ static int epoll_add(const struct uk_file *epf, struct epoll_entry **tail,
 	uk_file_acquire_weak(f);
 	*ent = (struct epoll_entry){
 		.next = NULL,
+		.ready_next = NULL,
+		.on_ready = 0,
 		.epf = epf,
 #if CONFIG_LIBVFSCORE
 		.legacy = 0,
@@ -425,6 +496,8 @@ struct uk_file *uk_epollfile_create(void)
 	/* Set fields */
 	al->alloc = a;
 	al->list = NULL;
+	al->inbox = NULL;
+	al->ready = NULL;
 	al->fstate = UK_FILE_STATE_INIT_VALUE(al->fstate);
 	al->frefcnt = UK_FILE_REFCNT_INIT_VALUE(al->frefcnt);
 	al->f = (struct uk_file){
@@ -558,7 +631,7 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 			int maxevents, const struct timespec *timeout,
 			const sigset_t *sigmask, size_t sigsetsize __unused)
 {
-	struct epoll_entry **list;
+	struct epoll_alloc *al = __containerof(epf, struct epoll_alloc, f);
 	__nsec deadline;
 
 	if (unlikely(epf->vol != EPOLL_VOLID))
@@ -571,8 +644,6 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 		uk_pr_warn_once("STUB: epoll_pwait no sigmask support\n");
 		return -ENOSYS;
 	}
-
-	list = (struct epoll_entry **)epf->node;
 
 	if (timeout) {
 		__snsec tout = uk_time_spec_to_nsec(timeout);
@@ -591,16 +662,22 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 	while (uk_file_poll_until(epf, UKFD_POLLIN, deadline)) {
 		int lvlev = 0;
 		int nout = 0;
+		struct epoll_entry **pp;
 
 		uk_file_event_clear(epf, UKFD_POLLIN);
-		uk_file_rlock(epf);
+		uk_file_wlock(epf);
 
-		/* gather & output event list */
-		for (struct epoll_entry *p = *list;
-		     p && nout < maxevents;
-		     p = p->next) {
+		/* Move newly-ready entries from the inbox to the ready list.
+		 * The walk below visits only those entries, not every fd. */
+		epoll_ready_drain(al);
+
+		/* gather & output event list, walking only ready entries */
+		pp = &al->ready;
+		while (*pp && nout < maxevents) {
+			struct epoll_entry *p = *pp;
 			unsigned int revents;
 			unsigned int *revp;
+			int keep = 0;
 
 #if CONFIG_LIBVFSCORE
 			if (p->legacy)
@@ -612,9 +689,8 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 			revents = uk_exchange_n(revp, 0);
 			if (revents) {
 				if (!IS_EDGEPOLL(p)) {
-					unsigned int mask;
-
-					mask = events2mask(p->event.events);
+					unsigned int mask =
+						events2mask(p->event.events);
 #if CONFIG_LIBVFSCORE
 					if (p->legacy) {
 						vfs_poll(p->vf, &revents,
@@ -622,22 +698,37 @@ int uk_sys_epoll_pwait2(const struct uk_file *epf, struct epoll_event *events,
 						revents &= mask;
 					} else
 #endif /* CONFIG_LIBVFSCORE */
-					{
-						revents = uk_file_poll_immediate(p->f, mask);
+						revents = uk_file_poll_immediate(
+							p->f, mask);
+					if (revents) {
+						lvlev = 1;
+						(void)uk_or(revp, revents);
+						keep = 1;
 					}
-					if (!revents)
-						continue;
-
-					lvlev = 1;
-					(void)uk_or(revp, revents);
 				}
+				if (revents) {
+					events[nout].events = revents;
+					events[nout].data = p->event.data;
+					nout++;
+				}
+			}
 
-				events[nout].events = revents;
-				events[nout].data = p->event.data;
-				nout++;
+			if (keep) {
+				/* Level entry still ready: keep it queued. */
+				pp = &p->ready_next;
+			} else {
+				/* Consumed or no longer ready. Unlink p from
+				 * the ready list first, then release its flag.
+				 * A callback may have set events on p while we
+				 * worked; re-queue p so those are not lost. */
+				*pp = p->ready_next;
+				p->ready_next = NULL;
+				uk_store_n(&p->on_ready, 0);
+				if (uk_load_n(revp))
+					epoll_ready_enqueue(al, p);
 			}
 		}
-		uk_file_runlock(epf);
+		uk_file_wunlock(epf);
 
 		/* If lvlev or limited by maxevents, update pollin back in */
 		if (lvlev || nout == maxevents)
