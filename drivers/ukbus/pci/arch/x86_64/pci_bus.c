@@ -54,6 +54,8 @@
 #include <string.h>
 
 #include <uk/arch/util.h>
+#include <uk/atomic.h>
+#include <uk/lcpu.h>
 #include <uk/print.h>
 #include <uk/bus/pci.h>
 
@@ -239,4 +241,131 @@ int arch_pci_probe(struct uk_alloc *pha)
 	}
 
 	return 0;
+}
+
+/*
+ * Build the CF8 address for one function and one 4-byte aligned
+ * configuration offset.
+ */
+static inline __u32 pci_conf_addr(const struct pci_address *addr,
+				  __u8 offset)
+{
+	return (__u32)PCI_ENABLE_BIT
+		| ((__u32)addr->bus << PCI_BUS_SHIFT)
+		| ((__u32)addr->devid << PCI_DEVICE_SHIFT)
+		| ((__u32)addr->function << PCI_FUNCTION_SHIFT)
+		| ((__u32)offset & 0xfcU);
+}
+
+/*
+ * The CF8/CFC port pair is one global resource. A config access
+ * writes the address to CF8, then reads or writes CFC. On an SMP
+ * guest two cores can interleave the two steps and hit the wrong
+ * register. Such a stray write can destroy a BAR or the MSI-X
+ * control word. One core holds this lock with interrupts off for
+ * the whole pair. Interrupts stay off so a handler on the lock
+ * holder cannot recurse into these accessors and deadlock.
+ * [Ticket 8c30628023]
+ */
+static unsigned int pci_conf_lock;
+
+static unsigned long pci_conf_lock_get(void)
+{
+	unsigned long flags = uk_lcpu_save_irqf();
+	unsigned int exp = 0;
+
+	while (!uk_compare_exchange_n(&pci_conf_lock, &exp, 1u))
+		exp = 0;
+
+	return flags;
+}
+
+static void pci_conf_lock_put(unsigned long flags)
+{
+	uk_exchange_n(&pci_conf_lock, 0u);
+	uk_lcpu_restore_irqf(flags);
+}
+
+/* Config space access helpers. The caller holds the lock. */
+static __u32 pci_conf_read32(const struct pci_address *addr, __u8 offset)
+{
+	uk_arch_x86_64_outl(PCI_CONFIG_ADDR, pci_conf_addr(addr, offset));
+	return uk_arch_x86_64_inl(PCI_CONFIG_DATA);
+}
+
+static void pci_conf_write32(const struct pci_address *addr, __u8 offset,
+			     __u32 value)
+{
+	uk_arch_x86_64_outl(PCI_CONFIG_ADDR, pci_conf_addr(addr, offset));
+	uk_arch_x86_64_outl(PCI_CONFIG_DATA, value);
+}
+
+__u32 uk_pci_read_config32(const struct pci_address *addr, __u8 offset)
+{
+	unsigned long flags;
+	__u32 value;
+
+	flags = pci_conf_lock_get();
+	value = pci_conf_read32(addr, offset);
+	pci_conf_lock_put(flags);
+
+	return value;
+}
+
+void uk_pci_write_config32(const struct pci_address *addr, __u8 offset,
+			   __u32 value)
+{
+	unsigned long flags;
+
+	flags = pci_conf_lock_get();
+	pci_conf_write32(addr, offset, value);
+	pci_conf_lock_put(flags);
+}
+
+__u64 uk_pci_read_bar(const struct pci_address *addr, __u8 bar)
+{
+	unsigned long flags;
+	__u32 low;
+	__u64 base;
+
+	if (bar < PCI_BASE_ADDRESS_0 || bar > PCI_BASE_ADDRESS_5)
+		return 0;
+
+	flags = pci_conf_lock_get();
+	low = pci_conf_read32(addr, bar);
+	if (low & 0x1U) { /* I/O space BAR. The value is a port number. */
+		base = (__u64)(low & ~0x3U);
+	} else {
+		base = (__u64)(low & ~0xfU);
+		/* 64-bit memory BAR: the next register holds the high
+		 * half. No register follows the last BAR, so a 64-bit
+		 * type field there is invalid and the high half stays
+		 * zero. [Ticket 8c30628023]
+		 */
+		if (((low >> 1) & 0x3U) == 0x2U &&
+		    bar != PCI_BASE_ADDRESS_5)
+			base |= (__u64)pci_conf_read32(addr, bar + 4) << 32;
+	}
+	pci_conf_lock_put(flags);
+
+	return base;
+}
+
+__u32 uk_pci_probe_bar_mask(const struct pci_address *addr, __u8 bar_off)
+{
+	unsigned long flags;
+	__u32 orig;
+	__u32 mask;
+
+	if (bar_off < PCI_BASE_ADDRESS_0 || bar_off > PCI_BASE_ADDRESS_5)
+		return 0;
+
+	flags = pci_conf_lock_get();
+	orig = pci_conf_read32(addr, bar_off);
+	pci_conf_write32(addr, bar_off, 0xffffffffU);
+	mask = pci_conf_read32(addr, bar_off);
+	pci_conf_write32(addr, bar_off, orig);
+	pci_conf_lock_put(flags);
+
+	return mask;
 }
