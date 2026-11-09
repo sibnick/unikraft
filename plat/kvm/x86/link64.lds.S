@@ -26,6 +26,18 @@
 #include <uk/arch/limits.h> /* for __PAGE_SIZE */
 #include <uk/plat/common/common.lds.h>
 
+/* 0001-plat-kvm-x86-drop-tls-phdrs.patch removed the tls and tls_load
+ * program headers to keep GRUB from seeing overlapping load segments.
+ * A configuration with a real .tdata (app-elfloader) still has to land
+ * those bytes in a load segment. The unikernel reads the TLS template
+ * through the _tls_start and _etdata symbols, not through PT_TLS, so
+ * keep the TLS section inside the data segment instead.
+ */
+#undef UK_SEGMENT_TLS
+#define UK_SEGMENT_TLS
+#undef UK_SEGMENT_TLS_LOAD
+#define UK_SEGMENT_TLS_LOAD :data
+
 #define BASE_ADDR 0x100000
 
 PHDRS
