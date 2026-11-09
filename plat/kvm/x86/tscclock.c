@@ -319,6 +319,7 @@ __u64 tscclock_epochoffset(void)
  */
 #define PIT_MIN_DELTA	16
 
+#if CONFIG_KVM_X86_LAPIC_ONESHOT
 /*
  * Per-vCPU LAPIC one-shot wake. [Ticket a5b91e7993]
  *
@@ -492,6 +493,13 @@ static void tscclock_lapic_prepare(void)
 	lapic_ready[id] = 1;
 	uk_pr_info("kvm: cpu %u LAPIC one-shot wake ready: %u ticks/us\n",
 		   id, (unsigned int)((lapic_mult[id] * 1000ULL) >> 32));
+
+	/* Name the option once at boot. A hypervisor that never
+	 * delivers the timer vector hangs with no other serial
+	 * error. [Ticket 9182e9a293]
+	 */
+	if (uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx) == 0)
+		uk_pr_warn("kvm: LAPIC one-shot wake is on (CONFIG_KVM_X86_LAPIC_ONESHOT=y). A hypervisor that drops the timer vector hangs on the first idle. Set the option to n for such hosts.\n");
 }
 
 /*
@@ -529,6 +537,7 @@ static void tscclock_cpu_block_lapic(unsigned int id, __u64 delta_ns)
 
 	uk_lcpu_halt_irq();
 }
+#endif /* CONFIG_KVM_X86_LAPIC_ONESHOT */
 
 /*
  * Returns early if any interrupts are serviced, or if the requested delay is
@@ -546,7 +555,7 @@ static void tscclock_cpu_block(__u64 until)
 	__u64 now, delta_ns;
 	__u64 delta_ticks;
 	unsigned int ticks;
-	unsigned int id;
+	unsigned int id __maybe_unused;
 
 	UK_ASSERT(uk_lcpu_irqs_disabled());
 
@@ -560,6 +569,7 @@ static void tscclock_cpu_block(__u64 until)
 	 * if it fails, this core keeps the i8254 arm.
 	 * [Ticket a5b91e7993]
 	 */
+#if CONFIG_KVM_X86_LAPIC_ONESHOT
 	id = uk_pcpuvar_current_get(uk_pcpuvar_cpu_id);
 	if (id < LAPIC_MAX_CPUS) {
 		if (!lapic_tried[id])
@@ -569,6 +579,7 @@ static void tscclock_cpu_block(__u64 until)
 			return;
 		}
 	}
+#endif
 
 	/*
 	 * Compute delta in PIT ticks. Return if it is less than minimum safe

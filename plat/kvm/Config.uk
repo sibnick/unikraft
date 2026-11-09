@@ -141,3 +141,22 @@ config KVM_VMM_QEMU_ISA_DEBUG_EXIT
 	depends on LIBUKPM
 	depends on KVM_VMM_QEMU
 	depends on ARCH_X86_64
+
+config KVM_X86_LAPIC_ONESHOT
+	bool "Per-vCPU LAPIC one-shot CPU idle wake"
+	depends on ARCH_X86_64
+	depends on HAVE_SMP
+	default n
+	help
+	  Arm the local APIC timer of the calling core to wake a
+	  halted core. Keep this enabled for multicore images. The
+	  i8254 fallback reaches only vCPU 0. Single-core builds do
+	  not offer this option. They always use the i8254 idle
+	  wake, the path proven on Google Cloud. The prepare probe
+	  checks that the masked one-shot counter runs down. Some
+	  hypervisors emulate the counter, but do not deliver the
+	  timer vector to a halted core, and the probe cannot see
+	  that case. One Google Cloud build hung on the first idle
+	  with this wake active. The boot prints one warning that
+	  names this option, so a silent hang is easier to trace.
+	  [Ticket 9182e9a293]
