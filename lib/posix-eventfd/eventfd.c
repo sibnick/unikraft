@@ -5,6 +5,9 @@
  */
 
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
+
+#include <uk/file.h>
 
 #include <uk/alloc.h>
 #include <uk/errptr.h>
@@ -109,13 +112,29 @@ static ssize_t evfd_write(const struct uk_file *f,
 	return sizeof(val);
 }
 
+/*
+ * The posix-fdio layer applies FIONBIO to the open file mode before it
+ * dispatches UKFILE_CTL_IOCTL here. Without this handler the call falls
+ * through to -ENOSYS, which uk_sys_ioctl() turns into -ENOTTY, and the
+ * application sees a failed non-blocking switch. Accept the request:
+ * the flag is already set.
+ */
+static int evfd_ctl(const struct uk_file *f __unused, int fam, int req,
+		    uintptr_t arg1 __unused, uintptr_t arg2 __unused,
+		    uintptr_t arg3 __unused)
+{
+	if (fam == UKFILE_CTL_IOCTL && req == FIONBIO)
+		return 0;
+	return uk_file_nop_ctl(f, fam, req, arg1, arg2, arg3);
+}
+
 static const struct uk_file_ops evfd_ops = {
 	.read = evfd_read,
 	.write = evfd_write,
 	.mem = uk_file_nop_mem,
 	.getstat = uk_file_nop_getstat,
 	.setstat = uk_file_nop_setstat,
-	.ctl = uk_file_nop_ctl
+	.ctl = evfd_ctl
 };
 
 static void evfd_release(const struct uk_file *f, int what)
