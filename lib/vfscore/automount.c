@@ -50,6 +50,9 @@
 #ifdef CONFIG_LIBUKCPIO
 #include <uk/cpio.h>
 #endif /* CONFIG_LIBUKCPIO */
+#ifdef CONFIG_LIBUKPAGING
+#include <uk/paging.h>
+#endif /* CONFIG_LIBUKPAGING */
 #include <uk/init.h>
 #include <uk/libparam.h>
 #include <uk/plat/memory.h>
@@ -493,10 +496,67 @@ static inline int vfscore_extract_parse_opts(const char *opts)
 	return optflags;
 }
 
+#ifdef CONFIG_LIBUKPAGING
+/*
+ * Return the initrd archive frames to the page frame allocator. The CPIO
+ * bytes are dead weight once ukcpio_extract() copied every file into the
+ * target filesystem. Handing the range to the frame allocator lets demand
+ * paging reuse those physical pages, which lowers the resident footprint by
+ * the archive size.
+ *
+ * The memregion list keeps the INITRD entry on purpose. Only the frame
+ * allocator owns the range afterwards, so the raw region allocator can never
+ * hand the same pages out a second time.
+ *
+ * Run this from boot context only. The buddy frame allocator adds memory
+ * without locking, and no other core may fault while the region grows. The
+ * automount path runs on the boot thread before the application starts, so
+ * this holds here.
+ */
+static void vfscore_release_initrd_frames(struct ukplat_memregion_desc *initrd)
+{
+	struct uk_pagetable *pt = uk_paging_pt_get_active();
+	size_t len = initrd->pg_count * UK_PAGING_PAGE_SIZE;
+	unsigned long mib;
+	int rc;
+
+	if (!pt || !pt->fa)
+		return;
+
+	mib = len >> 20;
+
+	/* The boot mapping of a multiboot module is read-only. Remap the
+	 * range read-write before touching it, then clear the archive bytes.
+	 * Some consumers take frames without zeroing them on the fault path,
+	 * for example thread stacks from libukallocstack. They rely on frames
+	 * that hold only zeroes, the state fresh guest RAM has at boot. The
+	 * identity mapping of the region is still valid here, so clear it in
+	 * place.
+	 */
+	rc = uk_paging_page_set_attr(pt, initrd->vbase, initrd->pg_count,
+				     UK_PAGING_PAGE_ATTR_PROT_READ |
+				     UK_PAGING_PAGE_ATTR_PROT_WRITE, 0);
+	if (unlikely(rc)) {
+		uk_pr_warn("initrd: read-write remap of %lu MiB failed: %d\n",
+			   mib, rc);
+		return;
+	}
+	memset((void *)initrd->vbase, 0, len);
+
+	rc = uk_paging_pt_add_mem(pt, initrd->pbase, len);
+	if (unlikely(rc && rc != -ENOMEM))
+		uk_pr_warn("initrd: release of %lu MiB failed: %d\n", mib, rc);
+	else
+		uk_pr_info("initrd: released %lu MiB to the frame allocator\n",
+			   mib);
+}
+#endif /* CONFIG_LIBUKPAGING */
+
 static int vfscore_extract_volume(const struct vfscore_volume *vv)
 {
 	const void *vbase = NULL;
 	size_t vlen = 0;
+	struct ukplat_memregion_desc *initrd = NULL;
 	int opts;
 	int rc;
 
@@ -506,8 +566,6 @@ static int vfscore_extract_volume(const struct vfscore_volume *vv)
 	/* Detect which initrd to use */
 	/* TODO: Support multiple Initial RAM Disks */
 	if (!strcmp(vv->sdev, LIBVFSCORE_EXTRACT_DEV_INITRD0)) {
-		struct ukplat_memregion_desc *initrd;
-
 		rc = vfscore_get_initrd0(&initrd);
 		if (unlikely(rc < 0)) {
 			uk_pr_crit("Could not find an initrd!\n");
@@ -563,6 +621,10 @@ static int vfscore_extract_volume(const struct vfscore_volume *vv)
 			   vv->path, rc);
 		return -EIO;
 	}
+#ifdef CONFIG_LIBUKPAGING
+	if (initrd)
+		vfscore_release_initrd_frames(initrd);
+#endif /* CONFIG_LIBUKPAGING */
 	return 0;
 }
 #endif /* CONFIG_LIBUKCPIO */
