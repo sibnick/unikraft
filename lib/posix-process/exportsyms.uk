@@ -58,3 +58,7 @@ tgkill
 signalfd
 uk_posix_process_create_pthread
 uk_posix_process_run
+sched_setaffinity
+sched_getaffinity
+uk_syscall_r_sched_setaffinity
+uk_syscall_r_sched_getaffinity
