@@ -1,0 +1,15 @@
+menuconfig LIBPOSIX_THREAD
+	bool "posix-thread: pthread affinity extensions"
+	depends on LIBUKSCHED
+	default n
+	help
+	  pthread_setaffinity_np()/pthread_getaffinity_np() and the
+	  pthread_attr_setaffinity_np()/pthread_attr_getaffinity_np()
+	  attribute calls for musl-style pthread handles, on top of the
+	  per-thread CPU affinity in lib/uksched.
+
+	  musl itself implements none of these calls. Applications built
+	  against musl outside of the unikernel image (for example a
+	  static musl ELF running through app-elfloader) must instead
+	  compile compat/pthread_affinity_musl.c into the application;
+	  see README.md in this directory.

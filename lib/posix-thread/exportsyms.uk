@@ -1,0 +1,6 @@
+uk_pthread_resolve
+uk_pthread_setaffinity_np
+uk_pthread_getaffinity_np
+uk_pthread_attr_setaffinity_np
+uk_pthread_attr_getaffinity_np
+uk_pthread_attr_take_affinity
