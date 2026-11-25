@@ -34,6 +34,7 @@
 #include <uk/lcpu.h>
 #include <uk/arch/time.h>
 #include <uk/arch/ctx.h>
+#include <uk/cpumask.h>
 #include <uk/wait_types.h>
 #include <uk/list.h>
 #include <uk/prio.h>
@@ -54,11 +55,11 @@ typedef void (*uk_thread_fn1_t)(void *) __noreturn;
 typedef void (*uk_thread_fn2_t)(void *, void *) __noreturn;
 
 struct uk_thread {
-	struct ukarch_ctx    ctx;	/**< Architecture context */
-	struct uk_lcpu_ectx *ectx;	/**< Extended context (FPU, VPU, ...) */
-	uintptr_t           tlsp;	/**< Current active TLS pointer */
-	__uptr            uktlsp;	/**< Unikraft TLS pointer */
-	__uptr		   auxsp;	/**< Unikraft Auxiliary Stack Pointer */
+	struct ukarch_ctx ctx;	   /**< Architecture context */
+	struct uk_lcpu_ectx *ectx; /**< Extended context (FPU, VPU, ...) */
+	uintptr_t tlsp;		   /**< Current active TLS pointer */
+	__uptr uktlsp;		   /**< Unikraft TLS pointer */
+	__uptr auxsp;		   /**< Unikraft Auxiliary Stack Pointer */
 
 	UK_TAILQ_ENTRY(struct uk_thread) queue;
 	uint32_t flags;
@@ -66,47 +67,72 @@ struct uk_thread {
 	struct uk_sched *sched;
 	struct uk_waitq_ticket wait_ticket;
 
+	/** CPU affinity mask. Valid when `affinity_set != 0`.
+	 *  An unset mask means "unrestricted": the thread runs on every
+	 *  online CPU, exactly as before affinity support. Schedulers
+	 *  consult `uk_thread_affinity_allows()` before running a thread
+	 *  on a CPU. Managed by `uk_sched_thread_setaffinity()`.
+	 */
+	struct uk_cpumask affinity;
+	/** Non-zero once an explicit affinity mask was assigned */
+	uint8_t affinity_set;
+	/** Hand-off in progress: the thread was affinity-migrated while
+	 *  running, is parked on its old CPU's sleep queue, and still has
+	 *  to be re-queued on its new scheduler (internal, affinity code
+	 *  and scheduler pick paths only)
+	 */
+	uint8_t migrate_pending;
+	uint8_t _aff_pad[6];
+
 	struct {
 		struct uk_alloc *t_a;
-		void            *stack;
+		void *stack;
 		struct uk_alloc *stack_a;
-		void            *uktls;
+		void *uktls;
 		struct uk_alloc *uktls_a;
-		void            *auxstack;
+		void *auxstack;
 		struct uk_alloc *auxstack_a;
-	} _mem;				/**< Associated allocs (internal!) */
-	uk_thread_gc_t _gc_fn;		/**< Extra gc function (internal!) */
-	void *_gc_argp;			/**< Argument for gc fn (internal!) */
+	} _mem;		       /**< Associated allocs (internal!) */
+	uk_thread_gc_t _gc_fn; /**< Extra gc function (internal!) */
+	void *_gc_argp;	       /**< Argument for gc fn (internal!) */
 
-	uk_thread_dtor_t dtor;		/**< User provided destructor */
-	void *priv;			/**< Private field, free for use */
+	uk_thread_dtor_t dtor; /**< User provided destructor */
+	void *priv;	       /**< Private field, free for use */
 
-	__nsec exec_time;		/**< Time the thread was scheduled */
-	const char *name;		/**< Reference to thread name */
+	__nsec exec_time; /**< Time the thread was scheduled */
+	const char *name; /**< Reference to thread name */
 	UK_TAILQ_ENTRY(struct uk_thread) thread_list;
 };
 
 UK_TAILQ_HEAD(uk_thread_list, struct uk_thread);
 
-#define uk_thread_terminate(thread) \
-	uk_sched_thread_terminate(thread)
-#define uk_thread_exit() \
-	uk_sched_thread_exit()
+#define uk_thread_terminate(thread) uk_sched_thread_terminate(thread)
+#define uk_thread_exit() uk_sched_thread_exit()
 
 /* managed by sched.c */
 extern __uk_pcpuvar struct uk_thread *__uk_sched_thread_current;
 
-static inline
-struct uk_thread *uk_thread_current(void)
+static inline struct uk_thread *uk_thread_current(void)
 {
 	return uk_pcpuvar_current_get(__uk_sched_thread_current);
 }
 
 /**
+ * True if `thread` may execute on the logical CPU `cpu`.
+ * Threads without an explicit affinity mask are unrestricted.
+ */
+static inline int uk_thread_affinity_allows(const struct uk_thread *thread,
+					    unsigned int cpu)
+{
+	return !thread->affinity_set ||
+	       uk_cpumask_test_cpu(cpu, &thread->affinity);
+}
+
+/**
  * Return thread containing the waitqueue ticket `ticket`.
  */
-static inline
-struct uk_thread *uk_thread_of_wait_ticket(struct uk_waitq_ticket *ticket)
+static inline struct uk_thread *
+uk_thread_of_wait_ticket(struct uk_waitq_ticket *ticket)
 {
 	return __containerof(ticket, struct uk_thread, wait_ticket);
 }
@@ -114,8 +140,7 @@ struct uk_thread *uk_thread_of_wait_ticket(struct uk_waitq_ticket *ticket)
 /**
  * True if `thread` is linked in a wait queue.
  */
-static inline
-bool uk_thread_in_waitq(struct uk_thread *thread)
+static inline bool uk_thread_in_waitq(struct uk_thread *thread)
 {
 	return !!thread->wait_ticket.wq;
 }
@@ -160,11 +185,11 @@ bool uk_thread_in_waitq(struct uk_thread *thread)
  *       termination callbacks as well.
  */
 
-#define UK_THREADF_ECTX       (0x001)	/**< Extended context available */
-#define UK_THREADF_AUXSP      (0x002)	/**< Thread has auxiliary stack */
-#define UK_THREADF_UKTLS      (0x004)	/**< Unikraft allocated TLS */
-#define UK_THREADF_RUNNABLE   (0x008)
-#define UK_THREADF_EXITED     (0x010)
+#define UK_THREADF_ECTX (0x001)	 /**< Extended context available */
+#define UK_THREADF_AUXSP (0x002) /**< Thread has auxiliary stack */
+#define UK_THREADF_UKTLS (0x004) /**< Unikraft allocated TLS */
+#define UK_THREADF_RUNNABLE (0x008)
+#define UK_THREADF_EXITED (0x010)
 /*
  *  A flag used for marking that a thread could potentially
  *  be added to the run queue. A thread marked as such must
@@ -172,24 +197,50 @@ bool uk_thread_in_waitq(struct uk_thread *thread)
  *  out from the CPU during a context switch), nor be already
  *  present in the run queue.
  */
-#define UK_THREADF_QUEUEABLE  (0x020)
+#define UK_THREADF_QUEUEABLE (0x020)
+/*
+ *  A flag used for marking that a thread is (or was, just before it
+ *  exited) the running thread of its CPU. Schedulers that support thread
+ *  CPU affinity maintain this flag in their pick path: it lets the
+ *  affinity code see that a remote thread must not be moved out of a
+ *  queue, because it is executing and owns no queue at the moment.
+ *  Schedulers that never set it only get affinity enforcement at
+ *  wake-up and thread_add time, never for running threads.
+ */
+#define UK_THREADF_EXECUTING (0x040)
 
-#define uk_thread_is_exited(t)   ((t)->flags & UK_THREADF_EXITED)
-#define uk_thread_is_runnable(t) (!uk_thread_is_exited(t) \
-				  && ((t)->flags & UK_THREADF_RUNNABLE))
-#define uk_thread_is_blocked(t)  ((t)->flags &				\
-				  (UK_THREADF_EXITED | UK_THREADF_RUNNABLE) == \
-				  0x0)
+#define uk_thread_is_exited(t) ((t)->flags & UK_THREADF_EXITED)
+#define uk_thread_is_runnable(t)                                               \
+	(!uk_thread_is_exited(t) && ((t)->flags & UK_THREADF_RUNNABLE))
+#define uk_thread_is_blocked(t)                                                \
+	((t)->flags & (UK_THREADF_EXITED | UK_THREADF_RUNNABLE) == 0x0)
 #define uk_thread_is_queueable(t) ((t)->flags & UK_THREADF_QUEUEABLE)
 
-#define uk_thread_set_runnable(t) \
-	do { (t)->flags |= UK_THREADF_RUNNABLE; } while (0)
-#define uk_thread_set_blocked(t) \
-	do { (t)->flags &= ~UK_THREADF_RUNNABLE; } while (0)
-#define uk_thread_set_queueable(t) \
-	do { (t)->flags |= UK_THREADF_QUEUEABLE; } while (0)
-#define uk_thread_clear_queueable(t) \
-	do { (t)->flags &= ~UK_THREADF_QUEUEABLE; } while (0)
+#define uk_thread_set_runnable(t)                                              \
+	do {                                                                   \
+		(t)->flags |= UK_THREADF_RUNNABLE;                             \
+	} while (0)
+#define uk_thread_set_blocked(t)                                               \
+	do {                                                                   \
+		(t)->flags &= ~UK_THREADF_RUNNABLE;                            \
+	} while (0)
+#define uk_thread_set_queueable(t)                                             \
+	do {                                                                   \
+		(t)->flags |= UK_THREADF_QUEUEABLE;                            \
+	} while (0)
+#define uk_thread_clear_queueable(t)                                           \
+	do {                                                                   \
+		(t)->flags &= ~UK_THREADF_QUEUEABLE;                           \
+	} while (0)
+#define uk_thread_set_executing(t)                                             \
+	do {                                                                   \
+		(t)->flags |= UK_THREADF_EXECUTING;                            \
+	} while (0)
+#define uk_thread_clear_executing(t)                                           \
+	do {                                                                   \
+		(t)->flags &= ~UK_THREADF_EXECUTING;                           \
+	} while (0)
+#define uk_thread_is_executing(t) ((t)->flags & UK_THREADF_EXECUTING)
 /* NOTE: Setting a thread as EXITED cannot be undone. */
 /* NOTE: Never change the EXIT flag manually. Trnasition to exit state reqiures
  * the terminate funcrtiomns to be called.
@@ -243,15 +294,9 @@ void uk_thread_set_exited(struct uk_thread *t);
  *   - (0):  Successfully initialized
  *   - (<0): Negative value with error code
  */
-int uk_thread_init_bare(struct uk_thread *t,
-			uintptr_t ip,
-			uintptr_t sp,
-			uintptr_t auxsp,
-			uintptr_t tlsp,
-			bool is_uktls,
-			struct uk_lcpu_ectx *ectx,
-			const char *name,
-			void *priv,
+int uk_thread_init_bare(struct uk_thread *t, uintptr_t ip, uintptr_t sp,
+			uintptr_t auxsp, uintptr_t tlsp, bool is_uktls,
+			struct uk_lcpu_ectx *ectx, const char *name, void *priv,
 			uk_thread_dtor_t dtor);
 
 /**
@@ -292,48 +337,31 @@ int uk_thread_init_bare(struct uk_thread *t,
  *   - (0):  Successfully initialized
  *   - (<0): Negative value with error code
  */
-int uk_thread_init_bare_fn0(struct uk_thread *t,
-			    uk_thread_fn0_t fn,
-			    uintptr_t sp,
-			    uintptr_t auxsp,
-			    uintptr_t tlsp,
-			    bool is_uktls,
-			    struct uk_lcpu_ectx *ectx,
-			    const char *name,
-			    void *priv,
+int uk_thread_init_bare_fn0(struct uk_thread *t, uk_thread_fn0_t fn,
+			    uintptr_t sp, uintptr_t auxsp, uintptr_t tlsp,
+			    bool is_uktls, struct uk_lcpu_ectx *ectx,
+			    const char *name, void *priv,
 			    uk_thread_dtor_t dtor);
 
 /**
  * Similar to `uk_thread_init_bare_fn0()` but with a thread function accepting
  * one argument
  */
-int uk_thread_init_bare_fn1(struct uk_thread *t,
-			    uk_thread_fn1_t fn,
-			    void *argp,
-			    uintptr_t sp,
-			    uintptr_t auxsp,
-			    uintptr_t tlsp,
-			    bool is_uktls,
-			    struct uk_lcpu_ectx *ectx,
-			    const char *name,
-			    void *priv,
+int uk_thread_init_bare_fn1(struct uk_thread *t, uk_thread_fn1_t fn, void *argp,
+			    uintptr_t sp, uintptr_t auxsp, uintptr_t tlsp,
+			    bool is_uktls, struct uk_lcpu_ectx *ectx,
+			    const char *name, void *priv,
 			    uk_thread_dtor_t dtor);
 
 /**
  * Similar to `uk_thread_init_bare_fn0()` but with a thread function accepting
  * two arguments
  */
-int uk_thread_init_bare_fn2(struct uk_thread *t,
-			    uk_thread_fn2_t fn,
-			    void *argp0, void *argp1,
-			    uintptr_t sp,
-			    uintptr_t auxsp,
-			    uintptr_t tlsp,
-			    bool is_uktls,
-			    struct uk_lcpu_ectx *ectx,
-			    const char *name,
-			    void *priv,
-			    uk_thread_dtor_t dtor);
+int uk_thread_init_bare_fn2(struct uk_thread *t, uk_thread_fn2_t fn,
+			    void *argp0, void *argp1, uintptr_t sp,
+			    uintptr_t auxsp, uintptr_t tlsp, bool is_uktls,
+			    struct uk_lcpu_ectx *ectx, const char *name,
+			    void *priv, uk_thread_dtor_t dtor);
 
 /**
  * Initializes a `uk_thread` structure and allocates stack and optionally TLS.
@@ -379,53 +407,33 @@ int uk_thread_init_bare_fn2(struct uk_thread *t,
  *   - (0):  Successfully initialized
  *   - (<0): Negative value with error code
  */
-int uk_thread_init_fn0(struct uk_thread *t,
-		       uk_thread_fn0_t fn,
-		       struct uk_alloc *a_stack,
-		       size_t stack_len,
-		       struct uk_alloc *a_auxstack,
-		       size_t auxstack_len,
-		       struct uk_alloc *a_uktls,
-		       bool custom_ectx,
-		       struct uk_lcpu_ectx *ectx,
-		       const char *name,
-		       void *priv,
+int uk_thread_init_fn0(struct uk_thread *t, uk_thread_fn0_t fn,
+		       struct uk_alloc *a_stack, size_t stack_len,
+		       struct uk_alloc *a_auxstack, size_t auxstack_len,
+		       struct uk_alloc *a_uktls, bool custom_ectx,
+		       struct uk_lcpu_ectx *ectx, const char *name, void *priv,
 		       uk_thread_dtor_t dtor);
 
 /**
  * Similar to `uk_thread_init_fn0()` but with a thread function accepting
  * one argument
  */
-int uk_thread_init_fn1(struct uk_thread *t,
-		       uk_thread_fn1_t fn,
-		       void *argp,
-		       struct uk_alloc *a_stack,
-		       size_t stack_len,
-		       struct uk_alloc *a_auxstack,
-		       size_t auxstack_len,
-		       struct uk_alloc *a_uktls,
-		       bool custom_ectx,
-		       struct uk_lcpu_ectx *ectx,
-		       const char *name,
-		       void *priv,
+int uk_thread_init_fn1(struct uk_thread *t, uk_thread_fn1_t fn, void *argp,
+		       struct uk_alloc *a_stack, size_t stack_len,
+		       struct uk_alloc *a_auxstack, size_t auxstack_len,
+		       struct uk_alloc *a_uktls, bool custom_ectx,
+		       struct uk_lcpu_ectx *ectx, const char *name, void *priv,
 		       uk_thread_dtor_t dtor);
 
 /**
  * Similar to `uk_thread_init_fn0()` but with a thread function accepting
  * two arguments
  */
-int uk_thread_init_fn2(struct uk_thread *t,
-		       uk_thread_fn2_t fn,
-		       void *argp0, void *argp1,
-		       struct uk_alloc *a_stack,
-		       size_t stack_len,
-		       struct uk_alloc *a_auxstack,
-		       size_t auxstack_len,
-		       struct uk_alloc *a_uktls,
-		       bool custom_ectx,
-		       struct uk_lcpu_ectx *ectx,
-		       const char *name,
-		       void *priv,
+int uk_thread_init_fn2(struct uk_thread *t, uk_thread_fn2_t fn, void *argp0,
+		       void *argp1, struct uk_alloc *a_stack, size_t stack_len,
+		       struct uk_alloc *a_auxstack, size_t auxstack_len,
+		       struct uk_alloc *a_uktls, bool custom_ectx,
+		       struct uk_lcpu_ectx *ectx, const char *name, void *priv,
 		       uk_thread_dtor_t dtor);
 
 /**
@@ -462,16 +470,11 @@ int uk_thread_init_fn2(struct uk_thread *t,
  *   - (NULL): Allocation failed
  *   - Reference to initialized uk_thread
  */
-struct uk_thread *uk_thread_create_bare(struct uk_alloc *a,
-					uintptr_t ip,
-					uintptr_t sp,
-					uintptr_t auxsp,
-					uintptr_t tlsp,
-					bool is_uktls,
-					bool no_ectx,
-					const char *name,
-					void *priv,
-					uk_thread_dtor_t dtor);
+struct uk_thread *uk_thread_create_bare(struct uk_alloc *a, uintptr_t ip,
+					uintptr_t sp, uintptr_t auxsp,
+					uintptr_t tlsp, bool is_uktls,
+					bool no_ectx, const char *name,
+					void *priv, uk_thread_dtor_t dtor);
 
 /**
  * Allocates a uk_thread container with stack and TLS. The entry point is not
@@ -511,16 +514,10 @@ struct uk_thread *uk_thread_create_bare(struct uk_alloc *a,
  *   - (NULL): Allocation failed
  *   - Reference to initialized uk_thread
  */
-struct uk_thread *uk_thread_create_container(struct uk_alloc *a,
-					     struct uk_alloc *a_stack,
-					     size_t stack_len,
-					     struct uk_alloc *a_auxstack,
-					     size_t auxstack_len,
-					     struct uk_alloc *a_uktls,
-					     bool no_ectx,
-					     const char *name,
-					     void *priv,
-					     uk_thread_dtor_t dtor);
+struct uk_thread *uk_thread_create_container(
+    struct uk_alloc *a, struct uk_alloc *a_stack, size_t stack_len,
+    struct uk_alloc *a_auxstack, size_t auxstack_len, struct uk_alloc *a_uktls,
+    bool no_ectx, const char *name, void *priv, uk_thread_dtor_t dtor);
 
 /**
  * Allocates a uk_thread container. Stack and TLS are given by the caller.
@@ -560,16 +557,10 @@ struct uk_thread *uk_thread_create_container(struct uk_alloc *a,
  *   - (NULL): Allocation failed
  *   - Reference to initialized uk_thread
  */
-struct uk_thread *uk_thread_create_container2(struct uk_alloc *a,
-					      uintptr_t sp,
-					      struct uk_alloc *a_auxstack,
-					      size_t auxstack_len,
-					      uintptr_t tlsp,
-					      bool is_uktls,
-					      bool no_ectx,
-					      const char *name,
-					      void *priv,
-					      uk_thread_dtor_t dtor);
+struct uk_thread *uk_thread_create_container2(
+    struct uk_alloc *a, uintptr_t sp, struct uk_alloc *a_auxstack,
+    size_t auxstack_len, uintptr_t tlsp, bool is_uktls, bool no_ectx,
+    const char *name, void *priv, uk_thread_dtor_t dtor);
 
 /*
  * Helper functions for initializing a thread container and setting it
@@ -578,10 +569,9 @@ struct uk_thread *uk_thread_create_container2(struct uk_alloc *a,
 void uk_thread_container_init_bare(struct uk_thread *t, uintptr_t ip);
 void uk_thread_container_init_fn0(struct uk_thread *t, uk_thread_fn0_t fn);
 void uk_thread_container_init_fn1(struct uk_thread *t, uk_thread_fn1_t fn,
-						       void *argp);
+				  void *argp);
 void uk_thread_container_init_fn2(struct uk_thread *t, uk_thread_fn2_t fn,
-						       void *argp0,
-						       void *argp1);
+				  void *argp0, void *argp1);
 
 /**
  * Allocates a raw uk_thread structure. Such a thread can then be assigned
@@ -620,50 +610,34 @@ void uk_thread_container_init_fn2(struct uk_thread *t, uk_thread_fn2_t fn,
  *   - (NULL): Allocation failed
  *   - Reference to initialized uk_thread
  */
-struct uk_thread *uk_thread_create_fn0(struct uk_alloc *a,
-				       uk_thread_fn0_t fn,
-				       struct uk_alloc *a_stack,
-				       size_t stack_len,
-				       struct uk_alloc *a_auxstack,
-				       size_t auxstack_len,
-				       struct uk_alloc *a_uktls,
-				       bool no_ectx,
-				       const char *name,
-				       void *priv,
-				       uk_thread_dtor_t dtor);
+struct uk_thread *
+uk_thread_create_fn0(struct uk_alloc *a, uk_thread_fn0_t fn,
+		     struct uk_alloc *a_stack, size_t stack_len,
+		     struct uk_alloc *a_auxstack, size_t auxstack_len,
+		     struct uk_alloc *a_uktls, bool no_ectx, const char *name,
+		     void *priv, uk_thread_dtor_t dtor);
 
 /**
  * Similar to `uk_thread_create_fn0()` but with a thread function accepting
  * one argument
  */
-struct uk_thread *uk_thread_create_fn1(struct uk_alloc *a,
-				       uk_thread_fn1_t fn, void *argp,
-				       struct uk_alloc *a_stack,
-				       size_t stack_len,
-				       struct uk_alloc *a_auxstack,
-				       size_t auxstack_len,
-				       struct uk_alloc *a_uktls,
-				       bool no_ectx,
-				       const char *name,
-				       void *priv,
-				       uk_thread_dtor_t dtor);
+struct uk_thread *
+uk_thread_create_fn1(struct uk_alloc *a, uk_thread_fn1_t fn, void *argp,
+		     struct uk_alloc *a_stack, size_t stack_len,
+		     struct uk_alloc *a_auxstack, size_t auxstack_len,
+		     struct uk_alloc *a_uktls, bool no_ectx, const char *name,
+		     void *priv, uk_thread_dtor_t dtor);
 
 /**
  * Similar to `uk_thread_create_fn0()` but with a thread function accepting
  * two arguments
  */
-struct uk_thread *uk_thread_create_fn2(struct uk_alloc *a,
-				       uk_thread_fn2_t fn,
-				       void *argp0, void *argp1,
-				       struct uk_alloc *a_stack,
-				       size_t stack_len,
-				       struct uk_alloc *a_auxstack,
-				       size_t auxstack_len,
-				       struct uk_alloc *a_uktls,
-				       bool no_ectx,
-				       const char *name,
-				       void *priv,
-				       uk_thread_dtor_t dtor);
+struct uk_thread *
+uk_thread_create_fn2(struct uk_alloc *a, uk_thread_fn2_t fn, void *argp0,
+		     void *argp1, struct uk_alloc *a_stack, size_t stack_len,
+		     struct uk_alloc *a_auxstack, size_t auxstack_len,
+		     struct uk_alloc *a_uktls, bool no_ectx, const char *name,
+		     void *priv, uk_thread_dtor_t dtor);
 
 void uk_thread_release(struct uk_thread *t);
 void uk_thread_block_until(struct uk_thread *thread, __snsec until);
@@ -678,8 +652,7 @@ void uk_thread_wake(struct uk_thread *thread);
  *  != 0: arm a wakeup timer for time `deadline`
  *  == 0: disarm wakeup timer
  */
-static inline
-void uk_thread_set_wakeup(struct uk_thread *t, __snsec deadline)
+static inline void uk_thread_set_wakeup(struct uk_thread *t, __snsec deadline)
 {
 	t->wakeup_time = deadline;
 }
@@ -695,17 +668,17 @@ void uk_thread_set_wakeup(struct uk_thread *t, __snsec deadline)
  * operand, we need to subtract the current TLS pointer to retrieve
  * the variable offset.
  */
-#define uk_thread_uktls_var(thread, variable)				\
-	(*({								\
-		__uptr _curr_tlsp = uk_lcpu_tlsp_get();			\
-		__sptr _offset;						\
-		typeof(variable) *_ref;					\
-									\
-		UK_ASSERT((thread)->flags & UK_THREADF_UKTLS);		\
-									\
-		_offset = _curr_tlsp - (__uptr) &(variable);		\
-		_ref = (typeof(_ref)) ((thread)->uktlsp - _offset);	\
-		_ref;							\
+#define uk_thread_uktls_var(thread, variable)                                  \
+	(*({                                                                   \
+		__uptr _curr_tlsp = uk_lcpu_tlsp_get();                        \
+		__sptr _offset;                                                \
+		typeof(variable) *_ref;                                        \
+                                                                               \
+		UK_ASSERT((thread)->flags &UK_THREADF_UKTLS);                  \
+                                                                               \
+		_offset = _curr_tlsp - (__uptr) & (variable);                  \
+		_ref = (typeof(_ref))((thread)->uktlsp - _offset);             \
+		_ref;                                                          \
 	}))
 
 /**
@@ -725,8 +698,8 @@ void uk_thread_set_wakeup(struct uk_thread *t, __snsec deadline)
  *  (>=0): Success
  *  (<0): Failure, thread creation will be aborted
  */
-typedef int  (*uk_thread_init_func_t)(struct uk_thread *child,
-				      struct uk_thread *parent);
+typedef int (*uk_thread_init_func_t)(struct uk_thread *child,
+				     struct uk_thread *parent);
 
 /**
  * Thread termination callback
@@ -746,22 +719,19 @@ struct uk_thread_inittab_entry {
 	uk_thread_term_func_t term;
 };
 
-#define UK_THREAD_INITF_ECTX  (UK_THREADF_ECTX)
+#define UK_THREAD_INITF_ECTX (UK_THREADF_ECTX)
 #define UK_THREAD_INITF_AUXSP (UK_THREADF_AUXSP)
 #define UK_THREAD_INITF_UKTLS (UK_THREADF_UKTLS)
-#define UK_THREAD_INITF_ALL   (UK_THREAD_INITF_ECTX | UK_THREAD_INITF_AUXSP | \
-			       UK_THREAD_INITF_UKTLS)
+#define UK_THREAD_INITF_ALL                                                    \
+	(UK_THREAD_INITF_ECTX | UK_THREAD_INITF_AUXSP | UK_THREAD_INITF_UKTLS)
 
-#define __UK_THREAD_INITTAB_ENTRY(init_fn, term_fn, prio, arg_flags)	\
-	static const struct uk_thread_inittab_entry			\
-	__used __section(".uk_thread_inittab" # prio) __align(8)	\
-		__uk_thread_inittab ## prio ## _ ## init_fn ## _ ## term_fn = {\
-		.flags = (arg_flags),					\
-		.init = (init_fn),					\
-		.term = (term_fn)					\
-	}
+#define __UK_THREAD_INITTAB_ENTRY(init_fn, term_fn, prio, arg_flags)           \
+	static const struct uk_thread_inittab_entry __used __section(          \
+	    ".uk_thread_inittab" #prio) __align(8)                             \
+	    __uk_thread_inittab##prio##_##init_fn##_##term_fn = {              \
+		.flags = (arg_flags), .init = (init_fn), .term = (term_fn)}
 
-#define _UK_THREAD_INITTAB_ENTRY(init_fn, term_fn, prio, flags)		\
+#define _UK_THREAD_INITTAB_ENTRY(init_fn, term_fn, prio, flags)                \
 	__UK_THREAD_INITTAB_ENTRY(init_fn, term_fn, prio, flags)
 
 /**
@@ -775,15 +745,15 @@ struct uk_thread_inittab_entry {
  *   Use the UK_PRIO_AFTER() helper macro for computing priority dependencies.
  *   Note: Any other value for level will be ignored
  */
-#define UK_THREAD_INIT_PRIO_FLAGS(init_fn, term_fn, prio, flags)	\
-	_UK_THREAD_INITTAB_ENTRY(init_fn, term_fn, prio,		\
+#define UK_THREAD_INIT_PRIO_FLAGS(init_fn, term_fn, prio, flags)               \
+	_UK_THREAD_INITTAB_ENTRY(init_fn, term_fn, prio,                       \
 				 ((flags) & (UK_THREAD_INITF_ALL)))
 
-#define UK_THREAD_INIT_PRIO(init_fn, term_fn, prio)			\
+#define UK_THREAD_INIT_PRIO(init_fn, term_fn, prio)                            \
 	UK_THREAD_INIT_PRIO_FLAGS(init_fn, term_fn, prio, (UK_THREAD_INITF_ALL))
 
-#define UK_THREAD_INIT(init_fn, term_fn)				\
-	UK_THREAD_INIT_PRIO_FLAGS(init_fn, term_fn, UK_PRIO_LATEST,	\
+#define UK_THREAD_INIT(init_fn, term_fn)                                       \
+	UK_THREAD_INIT_PRIO_FLAGS(init_fn, term_fn, UK_PRIO_LATEST,            \
 				  (UK_THREAD_INITF_ALL))
 
 #ifdef __cplusplus

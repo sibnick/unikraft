@@ -59,22 +59,21 @@ static inline struct uk_sched *uk_sched_current(void)
 	return NULL;
 }
 
-typedef void  (*uk_sched_yield_func_t)
-		(struct uk_sched *s);
+typedef void (*uk_sched_yield_func_t)(struct uk_sched *s);
 
-typedef int   (*uk_sched_thread_add_func_t)
-		(struct uk_sched *s, struct uk_thread *t);
-typedef void  (*uk_sched_thread_remove_func_t)
-		(struct uk_sched *s, struct uk_thread *t);
-typedef void  (*uk_sched_thread_blocked_func_t)
-		(struct uk_sched *s, struct uk_thread *t);
-typedef void  (*uk_sched_thread_woken_func_t)
-		(struct uk_sched *s, struct uk_thread *t);
+typedef int (*uk_sched_thread_add_func_t)(struct uk_sched *s,
+					  struct uk_thread *t);
+typedef void (*uk_sched_thread_remove_func_t)(struct uk_sched *s,
+					      struct uk_thread *t);
+typedef void (*uk_sched_thread_blocked_func_t)(struct uk_sched *s,
+					       struct uk_thread *t);
+typedef void (*uk_sched_thread_woken_func_t)(struct uk_sched *s,
+					     struct uk_thread *t);
 
-typedef const struct uk_thread * (*uk_sched_idle_thread_func_t)
-		(struct uk_sched *s, unsigned int proc_id);
+typedef const struct uk_thread *(*uk_sched_idle_thread_func_t)(
+    struct uk_sched *s, unsigned int proc_id);
 
-typedef int   (*uk_sched_start_t)(struct uk_sched *s, struct uk_thread *main);
+typedef int (*uk_sched_start_t)(struct uk_sched *s, struct uk_thread *main);
 
 #if CONFIG_LIBUKSCHED_STATS
 struct uk_sched_stats {
@@ -88,23 +87,38 @@ struct uk_sched_stats {
 struct uk_sched {
 	uk_sched_yield_func_t yield;
 
-	uk_sched_thread_add_func_t      thread_add;
-	uk_sched_thread_remove_func_t   thread_remove;
-	uk_sched_thread_blocked_func_t  thread_blocked;
-	uk_sched_thread_woken_func_t    thread_woken;
-	uk_sched_thread_woken_func_t    thread_woken_isr;
-	uk_sched_idle_thread_func_t     idle_thread;
+	uk_sched_thread_add_func_t thread_add;
+	uk_sched_thread_remove_func_t thread_remove;
+	uk_sched_thread_blocked_func_t thread_blocked;
+	uk_sched_thread_woken_func_t thread_woken;
+	uk_sched_thread_woken_func_t thread_woken_isr;
+	/*
+	 * Optional lock-free inbox for CPU migration (see
+	 * `uk_sched_thread_setaffinity()`). Schedulers with one instance
+	 * per CPU set this so that other CPUs can hand threads over
+	 * without touching the owner CPU's queues: the owner CPU drains
+	 * the inbox in its own schedule path. Schedulers without it only
+	 * support affinity on the local CPU.
+	 */
+	int (*thread_inbox)(struct uk_sched *s, struct uk_thread *t);
+	uk_sched_idle_thread_func_t idle_thread;
 
 	uk_sched_start_t sched_start;
 
 	/* internal */
 	bool is_started;
+	/** Linear CPU index of the logical CPU that runs this scheduler
+	 *  instance (`uk_sched_start()` records it), or -1 before start.
+	 *  The affinity code uses it to map CPU affinity masks onto the
+	 *  scheduler that owns each CPU.
+	 */
+	int cpu_id;
 	struct uk_thread_list thread_list;
 	struct uk_thread_list exited_threads;
-	struct uk_alloc *a;       /**< default allocator for struct uk_thread */
+	struct uk_alloc *a;	  /**< default allocator for struct uk_thread */
 	struct uk_alloc *a_stack; /**< default allocator for stacks */
 	struct uk_alloc *a_auxstack; /**< default allocator for aux stacks */
-	struct uk_alloc *a_uktls; /**< default allocator for TLS+ectx */
+	struct uk_alloc *a_uktls;    /**< default allocator for TLS+ectx */
 	struct uk_sched *next;
 #if CONFIG_LIBUKSCHED_STATS
 	__nsec start_time;
@@ -179,6 +193,103 @@ static inline const struct uk_thread *uk_sched_idle_thread(struct uk_sched *s,
 int uk_sched_start(struct uk_sched *sched);
 
 /**
+ * Linear index of the logical CPU the caller runs on, or -1 when the
+ * platform does not expose a CPU index.
+ */
+int uk_sched_current_cpu(void);
+
+/**
+ * Find the started scheduler instance that owns the logical CPU `cpu`.
+ *
+ * @return
+ *   - (NULL): No started scheduler runs on that CPU
+ *   - (>=): Reference to the scheduler
+ */
+struct uk_sched *uk_sched_get_for_cpu(int cpu);
+
+/**
+ * Return the set of currently online CPUs in `mask`.
+ */
+void uk_cpumask_online(struct uk_cpumask *mask);
+
+/**
+ * Return the affinity mask of `thread`.
+ *
+ * Threads without an explicitly assigned mask are unrestricted and report
+ * the currently online CPUs.
+ */
+void uk_sched_thread_getaffinity(const struct uk_thread *thread,
+				 struct uk_cpumask *mask);
+
+/**
+ * Assign the CPU affinity mask `mask` to `thread` and apply it.
+ *
+ * The mask must be non-empty and may only name online CPUs. The change
+ * takes effect immediately:
+ *   - A thread that is blocked or runnable but not running moves to the
+ *     scheduler of an allowed CPU at once.
+ *   - The calling thread moves and yields if its CPU is no longer allowed.
+ *   - A thread that is actively running on another CPU moves there at its
+ *     next scheduling point; the cooperative scheduler never preempts a
+ *     running thread.
+ *
+ * @return
+ *   - (0):  Success
+ *   - (-EINVAL): mask empty or names an offline/out-of-range CPU
+ *   - (-ENOENT): thread has no scheduler
+ */
+int uk_sched_thread_setaffinity(struct uk_thread *thread,
+				const struct uk_cpumask *mask);
+
+/**
+ * Move `thread` to the scheduler of a CPU allowed by its affinity mask.
+ *
+ * Callers: scheduler pick paths, when they notice a thread that is not
+ * allowed to run on the current CPU. Threads without an explicit mask are
+ * left alone.
+ *
+ * @return
+ *   - (0):  Thread moved to a different scheduler
+ *   - (1):  Thread stays where it is (allowed, or no allowed CPU hosts a
+ *           started scheduler yet)
+ *   - (<0): Error
+ */
+int uk_sched_thread_rehome(struct uk_thread *thread);
+
+/**
+ * Variant of `uk_sched_thread_rehome()` for scheduler pick paths that
+ * have just removed `thread` from their run queue: the thread owns no
+ * queue entry and is not executing, so only the scheduler bookkeeping
+ * and the destination `thread_add()` are performed.
+ */
+int uk_sched_thread_rehome_dequeued(struct uk_thread *thread);
+
+/**
+ * Start the CPU migration of `thread`, which is running on the calling
+ * CPU (the `prev` thread of a scheduler pick). The cooperative scheduler
+ * must not move a running thread between run queues, because the
+ * destination CPU could pick it up while its registers are still live.
+ *
+ * The hand-off instead re-homes the scheduler bookkeeping, parks the
+ * thread on the source scheduler's sleep queue with an expired deadline
+ * and blocks it. The next schedule run on the source CPU wakes it, which
+ * enqueues it on the destination run queue through the regular wake
+ * path and kicks a halted destination CPU.
+ *
+ * @return
+ *   - (0):  Hand-off started; the caller must not run `thread` again
+ *   - (1):  Nothing to do (allowed here, or no target scheduler yet)
+ *   - (<0): Failed; the thread stayed runnable where it was
+ */
+int uk_sched_thread_migrate_handoff(struct uk_thread *thread);
+
+/**
+ * Nudge the scheduler of logical CPU `cpu` to look at its run queue
+ * again (best effort, used after cross-CPU wake-ups).
+ */
+void uk_sched_kick_cpu(int cpu);
+
+/**
  * Allocates a uk_thread and assigns it to a scheduler.
  * Similar to `uk_thread_create_fn0()`, general-purpose registers are reset
  * on thread start.
@@ -215,52 +326,40 @@ int uk_sched_start(struct uk_sched *sched);
 struct uk_thread *uk_sched_thread_create_fn0(struct uk_sched *s,
 					     uk_thread_fn0_t fn0,
 					     size_t stack_len,
-					     size_t auxstack_len,
-					     bool no_uktls,
-					     bool no_ectx,
-					     const char *name,
-					     void *priv,
-					     uk_thread_dtor_t dtor);
+					     size_t auxstack_len, bool no_uktls,
+					     bool no_ectx, const char *name,
+					     void *priv, uk_thread_dtor_t dtor);
 
 /**
  * Similar to `uk_sched_thread_create_fn0()` but with a thread function
  * accepting one argument
  */
 struct uk_thread *uk_sched_thread_create_fn1(struct uk_sched *s,
-					     uk_thread_fn1_t fn1,
-					     void *argp,
+					     uk_thread_fn1_t fn1, void *argp,
 					     size_t stack_len,
-					     size_t auxstack_len,
-					     bool no_uktls,
-					     bool no_ectx,
-					     const char *name,
-					     void *priv,
-					     uk_thread_dtor_t dtor);
+					     size_t auxstack_len, bool no_uktls,
+					     bool no_ectx, const char *name,
+					     void *priv, uk_thread_dtor_t dtor);
 
 /**
  * Similar to `uk_sched_thread_create_fn0()` but with a thread function
  * accepting two arguments
  */
 struct uk_thread *uk_sched_thread_create_fn2(struct uk_sched *s,
-					     uk_thread_fn2_t fn2,
-					     void *argp0, void *argp1,
-					     size_t stack_len,
-					     size_t auxstack_len,
-					     bool no_uktls,
-					     bool no_ectx,
-					     const char *name,
-					     void *priv,
-					     uk_thread_dtor_t dtor);
+					     uk_thread_fn2_t fn2, void *argp0,
+					     void *argp1, size_t stack_len,
+					     size_t auxstack_len, bool no_uktls,
+					     bool no_ectx, const char *name,
+					     void *priv, uk_thread_dtor_t dtor);
 
 /* Shortcut for creating a thread with default settings */
-#define uk_sched_thread_create(s, fn1, argp, name)		\
-	uk_sched_thread_create_fn1((s), (fn1), (void *) (argp),	\
-				   0x0, 0x0, false, false,	\
-				   (name), NULL, NULL)
+#define uk_sched_thread_create(s, fn1, argp, name)                             \
+	uk_sched_thread_create_fn1((s), (fn1), (void *)(argp), 0x0, 0x0,       \
+				   false, false, (name), NULL, NULL)
 
-#define uk_sched_foreach_thread(sched, itr)				\
+#define uk_sched_foreach_thread(sched, itr)                                    \
 	UK_TAILQ_FOREACH((itr), &(sched)->thread_list, thread_list)
-#define uk_sched_foreach_thread_safe(sched, itr, tmp)			\
+#define uk_sched_foreach_thread_safe(sched, itr, tmp)                          \
 	UK_TAILQ_FOREACH_SAFE((itr), &(sched)->thread_list, thread_list, (tmp))
 
 void uk_sched_dumpk_threads(int klvl, struct uk_sched *s);

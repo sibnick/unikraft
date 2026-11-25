@@ -57,35 +57,37 @@ extern struct uk_sched *uk_sched_head;
 int uk_sched_register(struct uk_sched *s);
 
 #if CONFIG_LIBUKSCHED_STATS
-#define uk_sched_stats_reset(_s)			\
-	memset(&(_s)->stats, 0, sizeof((_s)->stats))
+#define uk_sched_stats_reset(_s) memset(&(_s)->stats, 0, sizeof((_s)->stats))
 #else
-#define uk_sched_stats_reset(_s) do {} while (0)
+#define uk_sched_stats_reset(_s)                                               \
+	do {                                                                   \
+	} while (0)
 #endif /* CONFIG_LIBUKSCHED_STATS */
 
-#define uk_sched_init(s, start_func, yield_func, \
-		thread_add_func, thread_remove_func, \
-		thread_blocked_func, thread_woken_func, \
-		thread_woken_isr_func, idle_thread_func, \
-		sched_a, sched_a_stack, sched_a_auxstack, sched_a_uktls) \
-	do { \
-		(s)->sched_start      = start_func; \
-		(s)->yield            = yield_func; \
-		(s)->thread_add       = thread_add_func; \
-		(s)->thread_remove    = thread_remove_func; \
-		(s)->thread_blocked   = thread_blocked_func; \
-		(s)->thread_woken     = thread_woken_func; \
-		(s)->thread_woken_isr = thread_woken_isr_func; \
-		(s)->idle_thread      = idle_thread_func; \
-		uk_sched_register((s)); \
-		\
-		(s)->a = (sched_a); \
-		(s)->a_stack = (sched_a_stack); \
-		(s)->a_auxstack = (sched_a_auxstack); \
-		(s)->a_uktls = (sched_a_uktls); \
-		UK_TAILQ_INIT(&(s)->thread_list); \
-		UK_TAILQ_INIT(&(s)->exited_threads); \
-		uk_sched_stats_reset(s); \
+#define uk_sched_init(                                                         \
+    s, start_func, yield_func, thread_add_func, thread_remove_func,            \
+    thread_blocked_func, thread_woken_func, thread_woken_isr_func,             \
+    idle_thread_func, sched_a, sched_a_stack, sched_a_auxstack, sched_a_uktls) \
+	do {                                                                   \
+		(s)->sched_start = start_func;                                 \
+		(s)->yield = yield_func;                                       \
+		(s)->thread_add = thread_add_func;                             \
+		(s)->thread_remove = thread_remove_func;                       \
+		(s)->thread_blocked = thread_blocked_func;                     \
+		(s)->thread_woken = thread_woken_func;                         \
+		(s)->thread_woken_isr = thread_woken_isr_func;                 \
+		(s)->idle_thread = idle_thread_func;                           \
+		(s)->cpu_id = -1;                                              \
+		(s)->thread_inbox = NULL;                                      \
+		uk_sched_register((s));                                        \
+                                                                               \
+		(s)->a = (sched_a);                                            \
+		(s)->a_stack = (sched_a_stack);                                \
+		(s)->a_auxstack = (sched_a_auxstack);                          \
+		(s)->a_uktls = (sched_a_uktls);                                \
+		UK_TAILQ_INIT(&(s)->thread_list);                              \
+		UK_TAILQ_INIT(&(s)->exited_threads);                           \
+		uk_sched_stats_reset(s);                                       \
 	} while (0)
 
 /**
@@ -97,8 +99,7 @@ int uk_sched_register(struct uk_sched *s);
  */
 unsigned int uk_sched_thread_gc(struct uk_sched *sched);
 
-static inline
-void uk_sched_thread_switch(struct uk_thread *next)
+static inline void uk_sched_thread_switch(struct uk_thread *next)
 {
 	struct uk_thread *prev;
 
@@ -156,10 +157,18 @@ static inline void uk_sched_stats_yield_count_incr(struct uk_sched *s)
 	s->stats.yield_count++;
 }
 #else /* !CONFIG_LIBUKSCHED_STATS */
-#define uk_sched_stats_idle_count_incr(_s)  do {} while (0)
-#define uk_sched_stats_next_count_incr(_s)  do {} while (0)
-#define uk_sched_stats_sched_count_incr(_s) do {} while (0)
-#define uk_sched_stats_yield_count_incr(_s) do {} while (0)
+#define uk_sched_stats_idle_count_incr(_s)                                     \
+	do {                                                                   \
+	} while (0)
+#define uk_sched_stats_next_count_incr(_s)                                     \
+	do {                                                                   \
+	} while (0)
+#define uk_sched_stats_sched_count_incr(_s)                                    \
+	do {                                                                   \
+	} while (0)
+#define uk_sched_stats_yield_count_incr(_s)                                    \
+	do {                                                                   \
+	} while (0)
 #endif /* !CONFIG_LIBUKSCHED_STATS */
 
 #ifdef __cplusplus

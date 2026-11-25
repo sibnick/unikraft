@@ -69,12 +69,9 @@ int uk_sched_register(struct uk_sched *s)
 struct uk_thread *uk_sched_thread_create_fn0(struct uk_sched *s,
 					     uk_thread_fn0_t fn0,
 					     size_t stack_len,
-					     size_t auxstack_len,
-					     bool no_uktls,
-					     bool no_ectx,
-					     const char *name,
-					     void *priv,
-					     uk_thread_dtor_t dtor)
+					     size_t auxstack_len, bool no_uktls,
+					     bool no_ectx, const char *name,
+					     void *priv, uk_thread_dtor_t dtor)
 {
 	struct uk_thread *t;
 	int rc;
@@ -86,15 +83,9 @@ struct uk_thread *uk_sched_thread_create_fn0(struct uk_sched *s,
 	if (!no_uktls && !s->a_uktls)
 		goto err_out;
 
-	t = uk_thread_create_fn0(s->a,
-				 fn0,
-				 s->a_stack, stack_len,
-				 s->a_auxstack, auxstack_len,
-				 no_uktls ? NULL : s->a_uktls,
-				 no_ectx,
-				 name,
-				 priv,
-				 dtor);
+	t = uk_thread_create_fn0(
+	    s->a, fn0, s->a_stack, stack_len, s->a_auxstack, auxstack_len,
+	    no_uktls ? NULL : s->a_uktls, no_ectx, name, priv, dtor);
 	if (!t)
 		goto err_out;
 
@@ -111,15 +102,11 @@ err_out:
 }
 
 struct uk_thread *uk_sched_thread_create_fn1(struct uk_sched *s,
-					     uk_thread_fn1_t fn1,
-					     void *argp,
+					     uk_thread_fn1_t fn1, void *argp,
 					     size_t stack_len,
-					     size_t auxstack_len,
-					     bool no_uktls,
-					     bool no_ectx,
-					     const char *name,
-					     void *priv,
-					     uk_thread_dtor_t dtor)
+					     size_t auxstack_len, bool no_uktls,
+					     bool no_ectx, const char *name,
+					     void *priv, uk_thread_dtor_t dtor)
 {
 	struct uk_thread *t;
 	int rc;
@@ -131,15 +118,9 @@ struct uk_thread *uk_sched_thread_create_fn1(struct uk_sched *s,
 	if (!no_uktls && !s->a_uktls)
 		goto err_out;
 
-	t = uk_thread_create_fn1(s->a,
-				 fn1, argp,
-				 s->a_stack, stack_len,
-				 s->a_auxstack, auxstack_len,
-				 no_uktls ? NULL : s->a_uktls,
-				 no_ectx,
-				 name,
-				 priv,
-				 dtor);
+	t = uk_thread_create_fn1(
+	    s->a, fn1, argp, s->a_stack, stack_len, s->a_auxstack, auxstack_len,
+	    no_uktls ? NULL : s->a_uktls, no_ectx, name, priv, dtor);
 	if (!t)
 		goto err_out;
 
@@ -156,15 +137,11 @@ err_out:
 }
 
 struct uk_thread *uk_sched_thread_create_fn2(struct uk_sched *s,
-					     uk_thread_fn2_t fn2,
-					     void *argp0, void *argp1,
-					     size_t stack_len,
-					     size_t auxstack_len,
-					     bool no_uktls,
-					     bool no_ectx,
-					     const char *name,
-					     void *priv,
-					     uk_thread_dtor_t dtor)
+					     uk_thread_fn2_t fn2, void *argp0,
+					     void *argp1, size_t stack_len,
+					     size_t auxstack_len, bool no_uktls,
+					     bool no_ectx, const char *name,
+					     void *priv, uk_thread_dtor_t dtor)
 {
 	struct uk_thread *t;
 	int rc;
@@ -176,15 +153,10 @@ struct uk_thread *uk_sched_thread_create_fn2(struct uk_sched *s,
 	if (!no_uktls && !s->a_uktls)
 		goto err_out;
 
-	t = uk_thread_create_fn2(s->a,
-				 fn2, argp0, argp1,
-				 s->a_stack, stack_len,
+	t = uk_thread_create_fn2(s->a, fn2, argp0, argp1, s->a_stack, stack_len,
 				 s->a_auxstack, auxstack_len,
-				 no_uktls ? NULL : s->a_uktls,
-				 no_ectx,
-				 name,
-				 priv,
-				 dtor);
+				 no_uktls ? NULL : s->a_uktls, no_ectx, name,
+				 priv, dtor);
 	if (!t)
 		goto err_out;
 
@@ -218,10 +190,8 @@ int uk_sched_start(struct uk_sched *s)
 	 */
 	tlsp = uk_lcpu_tlsp_get();
 	auxsp = uk_pcpuvar_current_get(UK_LCPU_AUXSP_SYM);
-	main_thread = uk_thread_create_bare(s->a,
-					    0x0, 0x0, auxsp,
-					    tlsp, !(!tlsp), false,
-					    "init", NULL, NULL);
+	main_thread = uk_thread_create_bare(
+	    s->a, 0x0, 0x0, auxsp, tlsp, !(!tlsp), false, "init", NULL, NULL);
 	if (!main_thread) {
 		ret = -ENOMEM;
 		goto err_out;
@@ -233,6 +203,11 @@ int uk_sched_start(struct uk_sched *s)
 	 * the thread as RUNNABLE.
 	 */
 	uk_thread_set_runnable(main_thread);
+	/* `main_thread` is executing right now. Schedulers with affinity
+	 * support maintain this flag in their pick path; the initial
+	 * context never passes through a pick.
+	 */
+	uk_thread_set_executing(main_thread);
 
 	/* Set main_thread as current scheduled thread */
 	uk_pcpuvar_current_set(__uk_sched_thread_current, main_thread);
@@ -243,6 +218,13 @@ int uk_sched_start(struct uk_sched *s)
 	/* Enable scheduler, like time slicing, etc. and notify that `s`
 	 * has an (already) scheduled thread
 	 */
+	/* Record which logical CPU runs this scheduler instance. Each
+	 * CPU of an SMP runtime starts its own scheduler; the affinity
+	 * code maps CPU masks onto schedulers through this binding.
+	 */
+	if (s->cpu_id < 0)
+		s->cpu_id = uk_sched_current_cpu();
+
 	ret = s->sched_start(s, main_thread);
 	if (ret < 0)
 		goto err_unset_thread_current;
@@ -267,18 +249,17 @@ unsigned int uk_sched_thread_gc(struct uk_sched *sched)
 	unsigned int num = 0;
 
 	/* Cleanup finished threads */
-	UK_TAILQ_FOREACH_SAFE(thread, &sched->exited_threads,
-			      thread_list, tmp) {
+	UK_TAILQ_FOREACH_SAFE(thread, &sched->exited_threads, thread_list, tmp)
+	{
 		UK_ASSERT(thread != uk_thread_current());
 		UK_ASSERT(uk_thread_is_exited(thread));
 
-		uk_pr_debug("%p: garbage collect thread %p (%s)\n",
-			    sched, thread,
-			    thread->name ? thread->name : "<unnamed>");
+		uk_pr_debug("%p: garbage collect thread %p (%s)\n", sched,
+			    thread, thread->name ? thread->name : "<unnamed>");
 
 		UK_TAILQ_REMOVE(&sched->exited_threads, thread, thread_list);
 		if (thread->_gc_fn)
-			thread->_gc_fn(thread,  thread->_gc_argp);
+			thread->_gc_fn(thread, thread->_gc_argp);
 		uk_thread_release(thread);
 		++num;
 	}
@@ -291,18 +272,18 @@ void uk_sched_thread_terminate(struct uk_thread *thread)
 	struct uk_sched *sched;
 
 	UK_ASSERT(thread);
-	 /* NOTE: The following assertion can also fail on a double-termination.
-	  *       This can happen when the thread was already put on the
-	  *       exited_thread list and waits for getting garbage collected.
-	  *       Double-termination can be avoided by testing for the exited
-	  *       flag.
-	  */
+	/* NOTE: The following assertion can also fail on a double-termination.
+	 *       This can happen when the thread was already put on the
+	 *       exited_thread list and waits for getting garbage collected.
+	 *       Double-termination can be avoided by testing for the exited
+	 *       flag.
+	 */
 	UK_ASSERT(thread->sched);
 
 	sched = thread->sched;
 
-	uk_pr_debug("%p: thread %p (%s) terminated\n",
-		    sched, thread, thread->name ? thread->name : "<unnamed>");
+	uk_pr_debug("%p: thread %p (%s) terminated\n", sched, thread,
+		    thread->name ? thread->name : "<unnamed>");
 
 	if (uk_thread_in_waitq(thread))
 		uk_waitq_cancel(thread);
@@ -313,9 +294,8 @@ void uk_sched_thread_terminate(struct uk_thread *thread)
 
 	if (thread == uk_thread_current()) {
 		/* enqueue thread for garbage collecting */
-		uk_pr_debug("%p: thread %p (%s) on gc list\n",
-			    sched, thread, thread->name ?
-					   thread->name : "<unnamed>");
+		uk_pr_debug("%p: thread %p (%s) on gc list\n", sched, thread,
+			    thread->name ? thread->name : "<unnamed>");
 		UK_TAILQ_INSERT_TAIL(&sched->exited_threads, thread,
 				     thread_list);
 
@@ -333,7 +313,7 @@ void uk_sched_thread_exit2(uk_thread_gc_t gc_fn, void *gc_argp)
 {
 	struct uk_thread *t = uk_thread_current();
 
-	t->_gc_fn   = gc_fn;
+	t->_gc_fn = gc_fn;
 	t->_gc_argp = gc_argp;
 	uk_sched_thread_terminate(t);
 	UK_CRASH("Unexpectedly returned to exited thread %p\n", t);
@@ -411,73 +391,99 @@ void uk_sched_dumpk_threads(int klvl, struct uk_sched *s)
 	}
 
 	uk_printk(klvl, "sched %p:\n", s);
-	uk_sched_foreach_thread_safe(s, t, tmp) {
+	uk_sched_foreach_thread_safe(s, t, tmp)
+	{
 		uk_printk(klvl,
 			  " + thread %p (%s), ctx: %p, "
-			  "execution time: %"__PRInsec".%06"__PRInsec"s, "
+			  "execution time: %"__PRInsec
+			  ".%06"__PRInsec
+			  "s, "
 			  "flags: %c%c%c%c%c\n",
-			  t, t->name ? t->name : "<unnamed>",
-			  &t->ctx,
+			  t, t->name ? t->name : "<unnamed>", &t->ctx,
 			  ukarch_time_nsec_to_sec(t->exec_time),
 			  ukarch_time_nsec_to_usec(t->exec_time) % 1000000,
 			  (t->flags & UK_THREADF_RUNNABLE) ? 'R' : '-',
-			  (t->flags & UK_THREADF_EXITED)   ? 'D' : '-',
-			  (t->flags & UK_THREADF_ECTX)     ? 'E' : '-',
-			  (t->flags & UK_THREADF_AUXSP)    ? 'A' : '-',
-			  (t->flags & UK_THREADF_UKTLS)    ? 'T' : '-');
+			  (t->flags & UK_THREADF_EXITED) ? 'D' : '-',
+			  (t->flags & UK_THREADF_ECTX) ? 'E' : '-',
+			  (t->flags & UK_THREADF_AUXSP) ? 'A' : '-',
+			  (t->flags & UK_THREADF_UKTLS) ? 'T' : '-');
 	}
 }
 
+/* Fallback affinity syscalls. When lib/posix-process is part of the
+ * image, sched_affinity.c provides the full Linux semantics, including
+ * tid resolution, and these definitions are compiled out.
+ */
+#if !CONFIG_LIBPOSIX_PROCESS
+
 UK_SYSCALL_R_DEFINE(int, sched_getaffinity, int, pid, long, cpusetsize,
-						unsigned long*, mask)
+		    unsigned long *, mask)
 {
-	UK_WARN_STUBBED();
-	/* NOTE: Some applications use this to get the count of CPUs,
-	 *       and the result must be positive.
-	 *       So just return CPU0 to make them run.
-	 */
-	UK_ASSERT(cpusetsize > 0);
-	UK_ASSERT(mask);
-	memset(mask, 0, cpusetsize);
+	struct uk_thread *t = uk_thread_current();
+	struct uk_cpumask m;
+	long rc;
 
-	/* Set CPU0 */
-	*mask = 1UL << 0;
+	if (!t)
+		return -ESRCH;
+	if (pid != 0 && pid != -1)
+		return -ENOSYS; /* No tid registry without posix-process */
 
-	return cpusetsize;
+	uk_sched_thread_getaffinity(t, &m);
+	rc = uk_cpumask_to_user(mask, cpusetsize, &m);
+	return (int)rc;
 }
 
 UK_SYSCALL_R_DEFINE(int, sched_setaffinity, int, pid, long, cpusetsize,
-						unsigned long*, mask)
+		    unsigned long *, mask)
 {
-	UK_WARN_STUBBED();
-	return 0;
+	struct uk_thread *t = uk_thread_current();
+	struct uk_cpumask m;
+	int rc;
+
+	/* Without posix-process we cannot resolve tids, but we can
+	 * still apply the mask to the calling thread instead of
+	 * silently dropping it.
+	 */
+	if (!t)
+		return -ESRCH;
+	if (pid != 0 && pid != -1)
+		return -ENOSYS;
+
+	rc = uk_cpumask_from_user(&m, mask, cpusetsize);
+	if (rc)
+		return rc;
+
+	return uk_sched_thread_setaffinity(t, &m);
 }
 
-#define MEMBARRIER_SUPPORTED_CMDS (\
-	MEMBARRIER_CMD_GLOBAL | \
-	MEMBARRIER_CMD_GLOBAL_EXPEDITED | \
-	MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED | \
-	MEMBARRIER_CMD_PRIVATE_EXPEDITED | \
-	MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED | \
-	MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE | \
-	MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE)
+#endif /* !CONFIG_LIBPOSIX_PROCESS */
+
+#define MEMBARRIER_SUPPORTED_CMDS                                              \
+	(MEMBARRIER_CMD_GLOBAL | MEMBARRIER_CMD_GLOBAL_EXPEDITED |             \
+	 MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED |                            \
+	 MEMBARRIER_CMD_PRIVATE_EXPEDITED |                                    \
+	 MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED |                           \
+	 MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE |                          \
+	 MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE)
 
 UK_LLSYSCALL_R_DEFINE(int, membarrier, int, cmd, unsigned int, flags,
 		      int __unused, cpu_id)
 {
 	/*
-	 * membarrier is intended as an optimized alternative to using SMP-safe
-	 * memory barriers in threads that might run in parallel.
-	 * In essence, it allows threads in the fast path to proceed without
-	 * barriers, while providing a safe option to trigger a barrier between
-	 * running threads on demand with the `membarrier` syscall.
-	 * Only threads actively executing on different cores are affected,
-	 * since sleeping threads are implicitly already "barriered".
+	 * membarrier is intended as an optimized alternative to using
+	 * SMP-safe memory barriers in threads that might run in
+	 * parallel. In essence, it allows threads in the fast path to
+	 * proceed without barriers, while providing a safe option to
+	 * trigger a barrier between running threads on demand with the
+	 * `membarrier` syscall. Only threads actively executing on
+	 * different cores are affected, since sleeping threads are
+	 * implicitly already "barriered".
 	 *
-	 * Without SMP support membarrier is a no-op, since only a single thread
+	 * Without SMP support membarrier is a no-op, since only a
+	 * single thread
 	 * -- the one calling membarrier -- can run at one time.
-	 * With SMP support, membarrier needs to force (a subset of) cores on
-	 * the system to execute memory barriers.
+	 * With SMP support, membarrier needs to force (a subset of)
+	 * cores on the system to execute memory barriers.
 	 */
 	if (unlikely(flags))
 		return -EINVAL;
@@ -488,7 +494,8 @@ UK_LLSYSCALL_R_DEFINE(int, membarrier, int, cmd, unsigned int, flags,
 	case MEMBARRIER_CMD_GLOBAL_EXPEDITED:
 	case MEMBARRIER_CMD_PRIVATE_EXPEDITED:
 	case MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE:
-		/* TODO: implement real cross-core barrier when SMP supported */
+		/* TODO: implement real cross-core barrier when SMP
+		 * supported */
 		return 0;
 	case MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED:
 	case MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED:

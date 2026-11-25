@@ -36,6 +36,15 @@ uk_thread_block_timeout
 uk_thread_block
 uk_thread_wake
 uk_thread_wake_isr
+uk_sched_current_cpu
+uk_sched_get_for_cpu
+uk_cpumask_online
+uk_sched_thread_getaffinity
+uk_sched_thread_setaffinity
+uk_sched_thread_rehome
+uk_sched_thread_rehome_dequeued
+uk_sched_thread_migrate_handoff
+uk_sched_kick_cpu
 __uk_sched_thread_current
 sched_yield
 sched_getaffinity

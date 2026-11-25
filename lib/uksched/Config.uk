@@ -23,4 +23,9 @@ config LIBUKSCHED_STATS
 	help
 		Provide scheduler stats via ukstore
 
+config LIBUKSCHED_TEST
+	bool "Enable tests"
+	default n
+	select LIBUKTEST
+
 endif
