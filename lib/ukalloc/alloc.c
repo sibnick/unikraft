@@ -52,6 +52,17 @@
 #include <uk/pcpuvar.h>
 #endif /* CONFIG_LIBUKPCPUVAR */
 
+#if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
+#include <uk/print.h>
+/* Heap canary. Place a guard pattern after each allocation's user data
+ * and verify it on free. A clobbered canary names the allocation that
+ * overran into its neighbor. Reuses the bbuddy sanity flag so a single
+ * config turns on all allocator diagnostics. [Ticket a9c6945c21] */
+#define UKALLOC_CANARY_BYTES 16
+#define UKALLOC_CANARY_A 0xdeadbeefcafebabeULL
+#define UKALLOC_CANARY_B 0x0123456789abcdefULL
+#endif
+
 #define size_to_num_pages(size) \
 	(UK_PAGING_PAGE_ALIGN_UP((unsigned long)(size)) / __PAGE_SIZE)
 #define page_off(x) ((unsigned long)(x) & (__PAGE_SIZE - 1))
@@ -163,7 +174,12 @@ void *uk_malloc_ifpages(struct uk_alloc *a, __sz size)
 #ifdef CONFIG_HAVE_MEMTAG
 	size = MEMTAG_ALIGN(size);
 #endif /* CONFIG_HAVE_MEMTAG */
+#if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
+	__sz realsize = METADATA_IFPAGES_SIZE_POW2 + size +
+			UKALLOC_CANARY_BYTES;
+#else
 	__sz realsize = METADATA_IFPAGES_SIZE_POW2 + size;
+#endif
 
 	UK_ASSERT(a);
 	/* check for invalid size and overflow */
@@ -180,6 +196,16 @@ void *uk_malloc_ifpages(struct uk_alloc *a, __sz size)
 	metadata->size = size;
 	metadata->num_pages = num_pages;
 	metadata->base = (void *) intptr;
+
+#if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
+	{
+		unsigned long long *canary = (unsigned long long *)
+			((char *) intptr + METADATA_IFPAGES_SIZE_POW2 + size);
+
+		canary[0] = UKALLOC_CANARY_A;
+		canary[1] = UKALLOC_CANARY_B;
+	}
+#endif
 
 #ifdef CONFIG_HAVE_MEMTAG
 	return ukarch_memtag_region(
@@ -212,11 +238,55 @@ void uk_free_ifpages(struct uk_alloc *a, void *ptr)
 	UK_ASSERT(metadata->base != __NULL);
 	UK_ASSERT(metadata->num_pages != 0);
 
+#if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
+	{
+		/* The canary sits just past the user region: userptr + size.
+		 * For uk_malloc that is base+METADATA+size; for uk_memalign
+		 * the user pointer is alignment-offset, so use ptr itself. */
+		unsigned long long *canary = (unsigned long long *)
+			((char *) ptr + metadata->size);
+
+		if (canary[0] != UKALLOC_CANARY_A ||
+		    canary[1] != UKALLOC_CANARY_B)
+			uk_pr_err("ukalloc canary: heap overrun ptr=%p size=%zu\n",
+				  ptr, (size_t) metadata->size);
+	}
+#endif
+
 	uk_pfree(a, metadata->base, metadata->num_pages);
 
 #ifdef CONFIG_HAVE_MEMTAG
 	ukarch_memtag_region(ptr, size);
 #endif /* CONFIG_HAVE_MEMTAG */
+}
+
+/*
+ * Check the heap canary of the allocation that contains ptr.
+ * Returns 1 if the canary is clobbered (a write ran past the object),
+ * 0 if it is intact or the canary is disabled. Callers use this to
+ * localize where an overrun happened: check at allocation hand-off and
+ * again at free. [Ticket a9c6945c21]
+ */
+int uk_alloc_canary_check(const void *ptr)
+{
+#if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
+	struct metadata_ifpages *metadata;
+	unsigned long long *canary;
+
+	if (!ptr)
+		return 0;
+	metadata = uk_get_metadata((void *)ptr);
+	if (!metadata->base || !metadata->num_pages)
+		return 0;
+	canary = (unsigned long long *)
+		((char *) ptr + metadata->size);
+	if (canary[0] != UKALLOC_CANARY_A || canary[1] != UKALLOC_CANARY_B)
+		return 1;
+	return 0;
+#else
+	(void)ptr;
+	return 0;
+#endif
 }
 
 void *uk_realloc_ifpages(struct uk_alloc *a, void *ptr, __sz size)
@@ -305,6 +375,10 @@ int uk_posix_memalign_ifpages(struct uk_alloc *a,
 	 * order to be sure to find an aligned pointer preceding `size` bytes.
 	 */
 	realsize = size + padding + align;
+#if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
+	/* Room for the heap canary just past the user region. */
+	realsize += UKALLOC_CANARY_BYTES;
+#endif
 
 	/* check for overflow */
 	if (realsize < size)
@@ -327,6 +401,16 @@ int uk_posix_memalign_ifpages(struct uk_alloc *a,
 	metadata->size = size;
 	metadata->num_pages = num_pages;
 	metadata->base = (void *) intptr;
+
+#if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
+	{
+		unsigned long long *canary = (unsigned long long *)
+			((char *) *memptr + size);
+
+		canary[0] = UKALLOC_CANARY_A;
+		canary[1] = UKALLOC_CANARY_B;
+	}
+#endif
 
 #ifdef CONFIG_HAVE_MEMTAG
 	ukarch_memtag_region(*memptr, size);
