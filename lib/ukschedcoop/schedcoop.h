@@ -12,6 +12,12 @@ struct schedcoop {
 	struct uk_sched sched;
 	struct uk_thread_list run_queue;
 	struct uk_thread_list sleep_queue;
+	/* Lock-free migration inbox (see schedcoop_thread_inbox()):
+	 * single-linked through `thread.queue.tqe_next`, pushed with a
+	 * CAS by migrating CPUs, drained with one exchange by this
+	 * scheduler's CPU.
+	 */
+	struct uk_thread *mbox;
 
 	struct uk_thread idle;
 	__nsec idle_return_time;

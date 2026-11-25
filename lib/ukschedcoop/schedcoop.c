@@ -33,10 +33,67 @@
 #include <uk/lcpu.h>
 #include <uk/plat/memory.h>
 #include <uk/plat/time.h>
+#include <uk/atomic.h>
 #include <uk/sched_impl.h>
 #include <uk/schedcoop.h>
 #include <uk/essentials.h>
 #include "schedcoop.h"
+
+/* Upper bound for an idle halt in multicore images, so that threads
+ * handed over through the affinity inbox are taken in within a short
+ * time even when the destination CPU has no other reason to wake up.
+ */
+#define UK_SCHEDCOOP_IDLE_POLL_NS (10000000LL) /* 10 ms */
+
+/* CPU-migration inbox (see `uk_sched.thread_inbox`).
+ *
+ * Producers on other CPUs push a not-queued thread here with a CAS,
+ * chaining through the `queue` link the thread owns while it belongs to
+ * no queue. The owner CPU takes the whole chain with one exchange and
+ * enqueues the threads on its own queues, so no scheduler list is ever
+ * mutated from two CPUs at the same time.
+ */
+static int schedcoop_thread_inbox(struct uk_sched *s, struct uk_thread *t)
+{
+	struct schedcoop *c = uksched2schedcoop(s);
+	struct uk_thread *head;
+
+	do {
+		head = uk_load_n(&c->mbox);
+		t->queue.tqe_next = head;
+	} while (!uk_compare_exchange_n(&c->mbox, &head, t));
+
+	return 0;
+}
+
+/* Drain the inbox: called from the scheduler's own CPU with interrupts
+ * off, from within the schedule path.
+ */
+static void schedcoop_inbox_drain(struct schedcoop *c)
+{
+	struct uk_thread *t, *next;
+
+	t = uk_exchange_n(&c->mbox, NULL);
+	while (t) {
+		next = t->queue.tqe_next;
+		t->queue.tqe_next = NULL;
+
+		if (unlikely(uk_thread_is_exited(t))) {
+			t = next;
+			continue;
+		}
+		if (uk_thread_is_runnable(t))
+			UK_TAILQ_INSERT_TAIL(&c->run_queue, t, queue);
+		else if (t->wakeup_time > 0)
+			/* Blocked with a deadline that moved here:
+			 * re-arm it on this scheduler's sleep queue so
+			 * the timeout keeps being tracked.
+			 */
+			UK_TAILQ_INSERT_TAIL(&c->sleep_queue, t, queue);
+
+		t = next;
+	}
+}
 
 static void schedcoop_schedule(struct uk_sched *s)
 {
@@ -44,6 +101,7 @@ static void schedcoop_schedule(struct uk_sched *s)
 	struct uk_thread *prev, *next, *thread, *tmp;
 	__snsec now, min_wakeup_time;
 	unsigned long flags;
+	int cpu;
 
 	if (unlikely(uk_lcpu_irqs_disabled()))
 		UK_CRASH("Must not call %s with IRQs disabled\n", __func__);
@@ -52,7 +110,7 @@ static void schedcoop_schedule(struct uk_sched *s)
 	prev = uk_thread_current();
 	flags = uk_lcpu_save_irqf();
 
-#if 0 //TODO
+#if 0 // TODO
 	if (in_callback)
 		UK_CRASH("Must not call %s from a callback\n", __func__);
 #endif
@@ -65,38 +123,121 @@ static void schedcoop_schedule(struct uk_sched *s)
 	prev->exec_time += now - c->ts_prev_switch;
 	c->ts_prev_switch = now;
 
+	/* The scheduler instances with affinity support maintain the
+	 * EXECUTING marker: `prev` is the running thread of this CPU.
+	 */
+	uk_thread_set_executing(prev);
+
+	cpu = uk_sched_current_cpu();
+
 	/* Examine all sleeping threads.
 	 * Wake up expired ones and find the time when the next timeout expires.
 	 */
 	min_wakeup_time = 0;
-	UK_TAILQ_FOREACH_SAFE(thread, &c->sleep_queue,
-			      queue, tmp) {
+	UK_TAILQ_FOREACH_SAFE(thread, &c->sleep_queue, queue, tmp)
+	{
 		if (likely(thread->wakeup_time)) {
-			if (thread->wakeup_time <= now)
+			/* A migrate_pending thread was affinity-moved
+			 * while parked here: cut its deadline and
+			 * finish the move now instead of waiting.
+			 */
+			if (thread->wakeup_time <= now ||
+			    unlikely(thread->migrate_pending)) {
 				uk_thread_wake(thread);
-			else if (!min_wakeup_time
-				 || thread->wakeup_time < min_wakeup_time)
+				/* Finish an affinity hand-off: the thread
+				 * is runnable and queued on this CPU now,
+				 * safely off its stack. Take it out of the
+				 * queue and move it to the scheduler of an
+				 * allowed CPU.
+				 */
+				if (unlikely(thread->migrate_pending)) {
+					thread->migrate_pending = 0;
+					UK_TAILQ_REMOVE(&c->run_queue,
+							thread, queue);
+					if (uk_sched_thread_rehome_dequeued(
+						    thread) != 0)
+						/* Nowhere to go or failed:
+						 * queue it here.
+						 */
+						UK_TAILQ_INSERT_TAIL(
+							&c->run_queue,
+							thread, queue);
+				}
+			} else if (!min_wakeup_time ||
+				   thread->wakeup_time < min_wakeup_time)
 				min_wakeup_time = thread->wakeup_time;
 		}
 	}
 
-	next = UK_TAILQ_FIRST(&c->run_queue);
-	if (next) {
+	/* Take in threads handed over by affinity migrations from other
+	 * CPUs before we pick.
+	 */
+	if (unlikely(uk_load_n(&c->mbox)))
+		schedcoop_inbox_drain(c);
+
+	/* Pick the first runnable thread that is allowed to run on this
+	 * CPU. Threads whose affinity mask excludes this CPU move to the
+	 * scheduler of an allowed CPU.
+	 */
+	next = NULL;
+	UK_TAILQ_FOREACH_SAFE(thread, &c->run_queue, queue, tmp)
+	{
+		if (cpu >= 0 &&
+		    !uk_thread_affinity_allows(thread, (unsigned int)cpu)) {
+			UK_TAILQ_REMOVE(&c->run_queue, thread, queue);
+			uk_thread_set_queueable(thread);
+			/* On failure the thread is re-added to this
+			 * queue, so it cannot get lost.
+			 */
+			uk_sched_thread_rehome_dequeued(thread);
+			continue;
+		}
+		next = thread;
+		UK_TAILQ_REMOVE(&c->run_queue, next, queue);
+
 		UK_ASSERT(next != prev);
 		UK_ASSERT(uk_thread_is_runnable(next));
 		UK_ASSERT(!uk_thread_is_exited(next));
-		UK_TAILQ_REMOVE(&c->run_queue, next,
-				queue);
+		break;
+	}
 
-		/* Put previous thread on the end of the list */
-		if ((prev != &c->idle)
-		    && uk_thread_is_runnable(prev)
-		    && !uk_thread_is_exited(prev))
-			UK_TAILQ_INSERT_TAIL(&c->run_queue, prev,
-					     queue);
-	} else if (uk_thread_is_runnable(prev)
-		   && !uk_thread_is_exited(prev)) {
+	if (next) {
+		/* Put previous thread on the end of the list, unless its
+		 * affinity excludes this CPU. Then it hands off to the
+		 * destination CPU instead (blocked here, enqueued
+		 * there), so the switch below leaves it safely.
+		 */
+		if ((prev != &c->idle) && uk_thread_is_runnable(prev) &&
+		    !uk_thread_is_exited(prev)) {
+			if (cpu < 0 ||
+			    uk_thread_affinity_allows(prev, (unsigned int)cpu))
+				UK_TAILQ_INSERT_TAIL(&c->run_queue, prev,
+						     queue);
+			else if (uk_sched_thread_migrate_handoff(prev) != 0)
+				/* Nowhere to go or failed: keep running
+				 * it here until the next pick.
+				 */
+				UK_TAILQ_INSERT_TAIL(&c->run_queue, prev,
+						     queue);
+		}
+	} else if (uk_thread_is_runnable(prev) && !uk_thread_is_exited(prev) &&
+		   (cpu < 0 ||
+		    uk_thread_affinity_allows(prev, (unsigned int)cpu))) {
 		next = prev;
+	} else if (uk_thread_is_runnable(prev) && !uk_thread_is_exited(prev)) {
+		/* The running thread must leave this CPU and nothing
+		 * allowed here is queued. Start the hand-off and idle:
+		 * the idle loop re-runs schedule() immediately (expired
+		 * deadline), which completes the move. If the thread
+		 * has nowhere to go (no started scheduler on an allowed
+		 * CPU yet), it stays.
+		 */
+		if (uk_sched_thread_migrate_handoff(prev) == 0) {
+			next = &c->idle;
+			c->idle_return_time = 1;
+			uk_sched_stats_idle_count_incr(s);
+		} else
+			next = prev;
 	} else {
 		/*
 		 * Schedule idle thread that will halt the CPU
@@ -116,6 +257,15 @@ static void schedcoop_schedule(struct uk_sched *s)
 		 */
 		uk_thread_set_queueable(prev);
 		uk_thread_clear_queueable(next);
+
+		/* `next` becomes the executing thread of this CPU; `prev`
+		 * stops executing when the context switch below leaves it.
+		 * The affinity code must not move `prev` out of the queue
+		 * it is on while it still executes here, so we clear the
+		 * marker only now and set it on `next`.
+		 */
+		uk_thread_clear_executing(prev);
+		uk_thread_set_executing(next);
 	}
 
 	uk_sched_stats_sched_count_incr(s);
@@ -157,9 +307,14 @@ static void schedcoop_thread_remove(struct uk_sched *s, struct uk_thread *t)
 	struct schedcoop *c = uksched2schedcoop(s);
 
 	/* Remove from run_queue */
-	if (t != uk_thread_current()
-	    && uk_thread_is_runnable(t))
+	if (t != uk_thread_current() && uk_thread_is_runnable(t))
 		UK_TAILQ_REMOVE(&c->run_queue, t, queue);
+	else if (!uk_thread_is_runnable(t) && t->wakeup_time > 0)
+		/* Blocked with a deadline: the thread sits on the sleep
+		 * queue. Leaving the link behind would corrupt the queue
+		 * when the thread moves to another CPU via affinity.
+		 */
+		UK_TAILQ_REMOVE(&c->sleep_queue, t, queue);
 }
 
 static void schedcoop_thread_blocked(struct uk_sched *s, struct uk_thread *t)
@@ -176,7 +331,7 @@ static void schedcoop_thread_blocked(struct uk_sched *s, struct uk_thread *t)
 
 static __noreturn void idle_thread_fn(void *argp)
 {
-	struct schedcoop *c = (struct schedcoop *) argp;
+	struct schedcoop *c = (struct schedcoop *)argp;
 	__nsec now, wake_up_time;
 	unsigned long flags;
 
@@ -197,7 +352,8 @@ static __noreturn void idle_thread_fn(void *argp)
 		 *        scheduler has always something to schedule.
 		 */
 		if (uk_sched_thread_gc(&c->sched) > 0 ||
-		    UK_TAILQ_FIRST(&c->run_queue)) {
+		    UK_TAILQ_FIRST(&c->run_queue) ||
+		    uk_load_n(&c->mbox)) {
 			/* We collected successfully some garbage or there is
 			 * a runnable thread in the queue.
 			 * Check if something else can be scheduled now.
@@ -215,8 +371,22 @@ static __noreturn void idle_thread_fn(void *argp)
 		}
 
 		/* Read return time set by last schedule operation */
-		wake_up_time = (volatile __nsec) c->idle_return_time;
+		wake_up_time = (volatile __nsec)c->idle_return_time;
 		now = ukplat_monotonic_clock();
+
+		/* In a multicore image this CPU may receive threads
+		 * through its affinity inbox at any moment, and the
+		 * sender cannot raise an interrupt here (cross-CPU
+		 * kicks are not reliable on all platforms). Bound the
+		 * halt so the inbox is drained promptly instead of
+		 * waiting for an event that may never come.
+		 */
+		if (uk_sched_head && uk_sched_head->next) {
+			__nsec cap = now + UK_SCHEDCOOP_IDLE_POLL_NS;
+
+			if (!wake_up_time || wake_up_time > cap)
+				wake_up_time = cap;
+		}
 
 		if (!wake_up_time || wake_up_time > now) {
 			if (wake_up_time)
@@ -278,8 +448,7 @@ static const struct uk_thread *schedcoop_idle_thread(struct uk_sched *s,
 	return &(c->idle);
 }
 
-struct uk_sched *uk_schedcoop_create(struct uk_alloc *a,
-				     struct uk_alloc *sa,
+struct uk_sched *uk_schedcoop_create(struct uk_alloc *a, struct uk_alloc *sa,
 				     struct uk_alloc *auxsa,
 				     struct uk_alloc *tls_a)
 {
@@ -295,30 +464,20 @@ struct uk_sched *uk_schedcoop_create(struct uk_alloc *a,
 	UK_TAILQ_INIT(&c->sleep_queue);
 
 	/* Create idle thread */
-	rc = uk_thread_init_fn1(&c->idle,
-				idle_thread_fn, (void *) c,
-				sa, STACK_SIZE,
-				auxsa, AUXSTACK_SIZE,
-				a, false,
-				NULL,
-				"idle",
-				NULL,
-				NULL);
+	rc = uk_thread_init_fn1(&c->idle, idle_thread_fn, (void *)c, sa,
+				STACK_SIZE, auxsa, AUXSTACK_SIZE, a, false,
+				NULL, "idle", NULL, NULL);
 	if (rc < 0)
 		goto err_free_c;
 
 	c->idle.sched = &c->sched;
 
-	uk_sched_init(&c->sched,
-			schedcoop_start,
-			schedcoop_yield,
-			schedcoop_thread_add,
-			schedcoop_thread_remove,
-			schedcoop_thread_blocked,
-			schedcoop_thread_woken_isr,
-			schedcoop_thread_woken_isr,
-			schedcoop_idle_thread,
-			a, sa, auxsa, tls_a);
+	uk_sched_init(&c->sched, schedcoop_start, schedcoop_yield,
+		      schedcoop_thread_add, schedcoop_thread_remove,
+		      schedcoop_thread_blocked, schedcoop_thread_woken_isr,
+		      schedcoop_thread_woken_isr, schedcoop_idle_thread, a, sa,
+		      auxsa, tls_a);
+	c->sched.thread_inbox = schedcoop_thread_inbox;
 
 	/* Add idle thread to the scheduler's thread list */
 	UK_TAILQ_INSERT_TAIL(&c->sched.thread_list, &c->idle, thread_list);
