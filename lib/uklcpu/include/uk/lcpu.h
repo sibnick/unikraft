@@ -61,6 +61,10 @@ UK_CTASSERT(sizeof(struct uk_lcpu_func) == UK_LCPU_FUNC_SIZE);
 #define UK_LCPU_ERR_OFFSET		(UK_LCPU_STATE_OFFSET + 0x4)
 #if CONFIG_HAVE_SMP
 #define UK_LCPU_FN_OFFSET		(UK_LCPU_ERR_OFFSET + 0x4)
+/* fn.user member offset. The architecture's AP startup trampoline may use
+ * this field as a boot hand-off channel (see the platform's pm .start()).
+ */
+#define UK_LCPU_FN_USER_OFFSET		(UK_LCPU_FN_OFFSET + 0x8)
 
 #define UK_LCPU_MEMBERS_SIZE						\
 	(UK_LCPU_FN_OFFSET + UK_LCPU_FUNC_SIZE)
@@ -116,6 +120,7 @@ UK_CTASSERT(__offsetof(struct uk_lcpu, state) == UK_LCPU_STATE_OFFSET);
 UK_CTASSERT(__offsetof(struct uk_lcpu, error_code) == UK_LCPU_ERR_OFFSET);
 #if CONFIG_HAVE_SMP
 UK_CTASSERT(__offsetof(struct uk_lcpu, fn) == UK_LCPU_FN_OFFSET);
+UK_CTASSERT(__offsetof(struct uk_lcpu, fn.user) == UK_LCPU_FN_USER_OFFSET);
 #endif /* CONFIG_HAVE_SMP */
 
 UK_CTASSERT(sizeof(struct uk_lcpu) == UK_LCPU_SIZE);

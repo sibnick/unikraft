@@ -299,7 +299,22 @@ static int sipi_vector_check(__u64 addr)
 
 static int kvm_x86_lcpu_start(__u64 idx)
 {
+	struct uk_lcpu *lcpu = &uk_pcpuvar_lval(idx, uk_lcpus);
+	__u64 cr3;
 	int rc;
+
+	/* Hand the live kernel CR3 to the AP through its lcpu slot. The
+	 * AP arrives on the boot page table (identity map of the first
+	 * 4GiB) while its startup stack can sit wherever the kernel
+	 * allocator put it, so lcpu_start64() switches to these page
+	 * tables before first stack use. Using fn.user is race-free: the
+	 * slot is in INIT state, owned by us until the AP starts running
+	 * functions, and uk_lcpu_fn_enqueue() always overwrites fn.user
+	 * before publishing fn.fn. [Ticket f05cbd814a]
+	 */
+	__asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3) : : "memory");
+	lcpu->fn.user = (void *)(__vaddr_t)cr3;
+	uk_arch_wmb();
 
 	/* Send INIT IPI */
 	rc = apic_send_iipi(uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id));

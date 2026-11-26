@@ -214,7 +214,8 @@ gdt64_ptr:
 	  UK_ARCH_X86_64_CR4_PAE	/* Physical Address Extension */
 
 #define EFER_BOOT32_SETTINGS						\
-	  UK_ARCH_X86_64_EFER_LME	/* IA-32e Mode */
+	  UK_ARCH_X86_64_EFER_LME	/* IA-32e Mode */		\
+	| UK_ARCH_X86_64_EFER_SCE	/* SYSCALL/SYSRET */
 
 #define CR0_BOOT32_SETTINGS						\
 	  UK_ARCH_X86_64_CR0_PE	/* Protected mode */			\
@@ -228,9 +229,25 @@ ENTRY(lcpu_start32)
 	movl	$CR4_BOOT32_SETTINGS, %eax
 	movl	%eax, %cr4
 
-	/* Switch to IA-32e mode (long mode) */
+	/* Switch to IA-32e mode (long mode).
+	 * SCE is set from the start: the kernel assumes SYSCALL/SYSRET
+	 * everywhere (the BSP aborts without it), so APs must not enter
+	 * long mode without it either. NXE is enabled if the CPU has the
+	 * Execute Disable Bit: the live kernel page tables may mark data
+	 * pages NX and, under a hypervisor, an NX PTE seen with NXE clear
+	 * is a reserved-bit violation that shuts the core down on its
+	 * first write.
+	 */
+	movl	$EFER_BOOT32_SETTINGS, %ebx
+	xorl	%ecx, %ecx
+	movl	$0x80000001, %eax
+	cpuid
+	testl	$UK_ARCH_X86_64_CPUID81_NX, %edx
+	jz	1f
+	orl	$UK_ARCH_X86_64_EFER_NXE, %ebx
+1:
+	movl	%ebx, %eax
 	xorl	%edx, %edx
-	movl	$EFER_BOOT32_SETTINGS, %eax
 	movl	$UK_ARCH_X86_64_MSR_EFER, %ecx
 	wrmsr
 
@@ -320,6 +337,24 @@ ENTRY(lcpu_start64)
 	 */
 	leaq	uk_lcpus(%rip), %rbp
 	addq	%rsp, %rbp
+
+	/* The trampoline still runs on the boot page table (identity map
+	 * of the first 4GiB), but the kernel may have long since switched
+	 * to its own page tables, where the AP startup stack published in
+	 * UK_LCPU_SSTACKP_SYM is actually mapped. The BSP hands over the
+	 * live kernel CR3 through the fn.user field of this CPU's lcpu
+	 * slot (see the platform pm .start() op). Load it here, before
+	 * %rsp is pointed at that stack and well before the first push
+	 * in the entry function. A zero field means the boot page table
+	 * is still the live one, so we simply keep going.
+	 */
+#if CONFIG_HAVE_SMP
+	movq	UK_LCPU_FN_USER_OFFSET(%rbp), %rax
+	testq	%rax, %rax
+	jz	3f
+	movq	%rax, %cr3
+3:
+#endif /* CONFIG_HAVE_SMP */
 
 	/* Put CPU into init state */
 	movl	$UK_LCPU_STATE_INIT, UK_LCPU_STATE_OFFSET(%rbp)
