@@ -184,6 +184,19 @@ config LIBUKBOOT_INITNOSCHED
 
 endchoice
 
+config LIBUKBOOT_INITSECONDARY
+	bool "Bring up secondary CPUs at boot"
+	depends on HAVE_SMP && LIBUKBOOT_INITSCHED && LIBUKBOOT_INITSCHEDCOOP
+	default n
+	help
+	  After the boot CPU starts its scheduler, start every other
+	  present CPU and run a dedicated schedcoop instance on each,
+	  idle until threads are pinned there through affinity masks.
+	  Without this the application must bring up the cores and
+	  their schedulers itself. The instances run on the default
+	  (thread-safe) heap; per-core heap partitions, if carved,
+	  stay reserved for the application.
+
 config LIBUKBOOT_MAINTHREAD
 	bool "Run application main in own thread"
 	depends on LIBUKBOOT_INITSCHED && LIBUKBOOT_INITALLOC

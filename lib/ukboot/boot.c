@@ -324,6 +324,236 @@ int uk_percore_heap_get(unsigned int i, __uptr *base, __sz *len)
 
 #endif /* CONFIG_LIBUKBOOT_PERCORE_HEAP */
 
+#if CONFIG_HAVE_SMP && CONFIG_LIBUKBOOT_INITSECONDARY
+#if CONFIG_LIBUKACPI && CONFIG_ARCH_X86_64 &&				\
+	CONFIG_LIBUKACPI_MADT_FILL_CPU_IDMAP
+#include <uk/acpi/madt.h>
+#endif
+#include <uk/alloc.h>
+#include <uk/atomic.h>
+#include <uk/pcpuvar.h>
+#include <string.h>
+
+/*
+ * Secondary CPU bring-up.
+ *
+ * Nothing in the platform or boot path used to call uk_lcpu_start(),
+ * so schedcoop ran on lcpu 0 only and applications had to start the
+ * other cores, per-CPU scheduler instances included, on their own.
+ * With the trampoline fixed (EFER, kernel CR3 hand-off, per-AP
+ * SYSCALL MSRs: [Ticket f05cbd814a]) the platform can own that boot
+ * step. uk_boot_entry() calls secondary_cpus_init() right after the
+ * boot CPU has started its own scheduler. For every offline CPU it
+ *
+ *   - creates and registers a schedcoop instance. uk_schedcoop_create()
+ *     registers through uk_sched_init(), and registration changes the
+ *     global scheduler list without a lock, so all instances are
+ *     created here, on the BSP, before any AP is released,
+ *   - allocates a startup stack and faults in every page on the BSP:
+ *     paging maps heap pages on demand, and an AP faults on its
+ *     startup stack before its entry installs an IDT, which ends in a
+ *     triple fault,
+ *   - starts the CPU, then waits, bounded, for it to come online.
+ *
+ * The instances run on the default heap, which is the thread-safe
+ * bbuddy. Not on the LIBUKBOOT_PERCORE_HEAP partitions: affinity
+ * migration can free thread state on a CPU other than the one that
+ * allocated it, and a partition allocator has a single owner and no
+ * lock. The partitions stay available for the application's data
+ * path. [Ticket 25834da0d9]
+ *
+ * Each AP entry (uk_secondary_entry) initializes its logical CPU,
+ * gives the init context the TLS/auxiliary-stack facilities that
+ * uk_boot_entry() gives the BSP context, binds its scheduler with
+ * uk_sched_start(), which records the cpu_id binding that the
+ * affinity code maps masks onto, and then runs that scheduler
+ * forever. It stays idle until a thread is pinned to the CPU.
+ */
+#define UK_SECONDARY_STACK_SIZE		16384
+
+struct uk_secondary_cpu {
+	struct uk_sched *sched;
+	struct uk_alloc *a;
+};
+
+static struct uk_secondary_cpu
+	uk_secondary_cpus[CONFIG_UKPLAT_CPU_MAXCOUNT];
+
+/* Number of present CPUs: the ACPI MADT gives it on x86_64,
+ * otherwise the configured maximum. Same rule as the per-core heap
+ * carve. [Ticket 9a037affad]
+ */
+static unsigned int secondary_ncores(void)
+{
+	unsigned int n = CONFIG_UKPLAT_CPU_MAXCOUNT;
+
+#if CONFIG_LIBUKACPI && CONFIG_ARCH_X86_64 &&				\
+	CONFIG_LIBUKACPI_MADT_FILL_CPU_IDMAP
+	if (uk_acpi_present_cpu_count > 0 &&
+	    uk_acpi_present_cpu_count < n)
+		n = uk_acpi_present_cpu_count;
+#endif
+	return n;
+}
+
+static __noreturn void uk_secondary_entry(struct uk_lcpu *this_lcpu)
+{
+	unsigned int cpu = (unsigned int)
+		uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx);
+	struct uk_secondary_cpu *sc;
+	struct ukarch_auxspcb *auxspcb;
+	struct uk_alloc *a;
+	void *tls, *auxstack;
+	__uptr uktlsp, auxsp;
+
+	if (unlikely(cpu >= ARRAY_SIZE(uk_secondary_cpus)))
+		uk_lcpu_halt();
+	sc = &uk_secondary_cpus[cpu];
+	if (unlikely(!sc->sched))
+		uk_lcpu_halt();
+
+	if (unlikely(uk_lcpu_init(this_lcpu)))
+		uk_lcpu_halt();
+
+	/* Give this context the same facilities uk_boot_entry()
+	 * gives the BSP context: a UKTLS area and an auxiliary
+	 * stack. A posix thread created later on this scheduler
+	 * asserts that its creating context carries UKTLS. [Ticket
+	 * 25834da0d9]
+	 */
+	a = sc->a;
+	tls = uk_memalign(a, ukarch_tls_area_align(),
+			  ukarch_tls_area_size());
+	if (unlikely(!tls))
+		uk_lcpu_halt();
+	ukarch_tls_area_init(tls);
+	uktlsp = ukarch_tls_tlsp(tls);
+	uk_lcpu_tlsp_set(uktlsp);
+
+	auxstack = uk_memalign(a, UKARCH_AUXSP_ALIGN, AUXSTACK_SIZE);
+	if (unlikely(!auxstack))
+		uk_lcpu_halt();
+	auxsp = ukarch_gen_sp(auxstack, AUXSTACK_SIZE);
+	ukarch_auxsp_init(auxsp);
+	auxspcb = ukarch_auxsp_get_cb(auxsp);
+	if (unlikely(!auxspcb))
+		uk_lcpu_halt();
+	ukarch_auxspcb_set_uktlsp(auxspcb, uktlsp);
+	uk_lcpu_set_auxsp(auxsp);
+
+	/* Bind this context as the init thread of this CPU's
+	 * scheduler. uk_sched_start() records the CPU binding that
+	 * maps affinity masks onto this scheduler.
+	 */
+	if (unlikely(uk_sched_start(sc->sched)))
+		uk_lcpu_halt();
+
+	/* BUSY0 -> IDLE. This is the state the idle path expects. */
+	uk_dec(&this_lcpu->state);
+
+	uk_lcpu_enable_irq();
+
+	while (1)
+		uk_sched_yield();
+}
+
+static void secondary_cpus_init(struct uk_alloc *a)
+{
+	static __u64 idx[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
+	static __uptr sp[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
+	static __uptr entry[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
+	unsigned int ncores = secondary_ncores();
+	unsigned int n = 0, started, i, j;
+	int rc;
+
+	for (i = 1; i < ncores; i++) {
+		struct uk_secondary_cpu *sc = &uk_secondary_cpus[i];
+		struct uk_sched *s;
+		void *stk;
+
+		if (uk_load_n(&uk_pcpuvar_lval((__u64)i, uk_lcpus).state)
+		    != UK_LCPU_STATE_OFFLINE)
+			continue;
+
+		stk = uk_malloc(a, UK_SECONDARY_STACK_SIZE);
+		if (unlikely(!stk)) {
+			uk_pr_warn("ukboot: cpu %u: no startup stack\n", i);
+			continue;
+		}
+		/* Fault in every stack page on the BSP. Paging maps
+		 * heap pages on demand. An AP takes the page fault
+		 * before it loads an IDT, which ends in a triple
+		 * fault. Writing the pages here makes them present
+		 * in the page table the AP loads. [Ticket 25834da0d9]
+		 */
+		memset(stk, 0, UK_SECONDARY_STACK_SIZE);
+
+		/* Create and register this AP's scheduler here, on
+		 * the BSP, before the release: registration changes
+		 * the global scheduler list without a lock, and the
+		 * instance must exist before this CPU can run
+		 * threads. [Ticket 25834da0d9]
+		 */
+		s = uk_schedcoop_create(a, a, a, a);
+		if (unlikely(!s)) {
+			uk_pr_warn("ukboot: cpu %u: scheduler create failed\n",
+				   i);
+			uk_free(a, stk);
+			continue;
+		}
+
+		sc->sched = s;
+		sc->a = a;
+
+		idx[n] = i;
+		sp[n] = (__uptr)stk + UK_SECONDARY_STACK_SIZE;
+		entry[n] = (__uptr)uk_secondary_entry;
+		n++;
+	}
+
+	if (n == 0) {
+		uk_pr_info("ukboot: no secondary CPUs to start\n");
+		return;
+	}
+
+	started = n;
+	rc = uk_lcpu_start(idx, &started, sp, entry, 0);
+	if (unlikely(rc))
+		uk_pr_warn("ukboot: uk_lcpu_start: %d, %u of %u CPUs released\n",
+			   rc, started, n);
+
+	for (j = 0; j < started; j++) {
+		struct uk_lcpu *lcpu =
+			&uk_pcpuvar_lval(idx[j], uk_lcpus);
+		unsigned long spins;
+		int online = 0;
+
+		/*
+		 * Bounded wait for the AP to come online.
+		 * uk_load_n reloads the state on every iteration. A
+		 * plain read can be hoisted out of this spin loop by
+		 * the compiler. [Ticket 25834da0d9]
+		 */
+		for (spins = 0; spins < 200000000UL; spins++) {
+			if (uk_lcpu_state_is_online(
+				    uk_load_n(&lcpu->state))) {
+				online = 1;
+				break;
+			}
+#if CONFIG_ARCH_X86_64
+			__asm__ __volatile__("pause");
+#endif
+		}
+		if (online)
+			uk_pr_info("ukboot: cpu %u online\n",
+				   (unsigned int)idx[j]);
+		else
+			uk_pr_warn("ukboot: cpu %u did not come online\n",
+				   (unsigned int)idx[j]);
+	}
+}
+#endif /* CONFIG_HAVE_SMP && CONFIG_LIBUKBOOT_INITSECONDARY */
+
 static struct uk_alloc *heap_init()
 {
 	struct uk_alloc *a = NULL;
@@ -576,6 +806,15 @@ void uk_boot_entry(void)
 	if (unlikely(!s))
 		UK_CRASH("Failed to initialize scheduling\n");
 	uk_sched_start(s);
+
+#if CONFIG_HAVE_SMP && CONFIG_LIBUKBOOT_INITSECONDARY
+	/* Secondary CPUs next. Their schedulers only need the
+	 * scheduler core up; application threads reach them through
+	 * the affinity code once main runs.
+	 */
+	uk_pr_info("Bringing up secondary CPUs...\n");
+	secondary_cpus_init(a);
+#endif /* CONFIG_HAVE_SMP && CONFIG_LIBUKBOOT_INITSECONDARY */
 #endif /* CONFIG_LIBUKBOOT_INITSCHED */
 
 	ictx.cmdline.argc = boot_argc;
