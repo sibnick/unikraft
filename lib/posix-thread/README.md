@@ -74,6 +74,7 @@ APP_LDGROUNDS_GCCLIBS := -Wl,--wrap=pthread_create
 - The kernel-side resolution assumes the musl x86_64 TLS layout; on
   other architectures `uk_pthread_resolve()` returns `NULL` and callers
   get `ESRCH`.
+
 ## Related
 
 The placement semantics the affinity calls interact with — sticky
