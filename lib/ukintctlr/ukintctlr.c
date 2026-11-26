@@ -27,6 +27,7 @@
 
 #include <stdlib.h>
 #include <uk/alloc.h>
+#include <uk/arch/spinlock.h>
 #include <uk/atomic.h>
 #include <uk/bitops/bitmap.h>
 #include <uk/lcpu.h>
@@ -247,17 +248,35 @@ int uk_intctlr_irq_fdt_xlat(const void *fdt, int nodeoffset, __u32 index,
 	return uk_intctlr->ops->fdt_xlat(fdt, nodeoffset, index, irq);
 }
 
+/*
+ * Guards the irqs_allocated bitmap. uk_intctlr_irq_alloc() finds a free
+ * range of vectors and then marks it. That find-then-set window lets two
+ * cores allocate the same MSI-X vector, for example when the JVM brings
+ * up two per-core net queue groups at the same time. The lock covers
+ * free as well so the bitmap is never updated concurrently from
+ * different paths, and it is taken with interrupts off. [Ticket
+ * f05cbd814a]
+ */
+static __spinlock irq_alloc_lock = UKARCH_SPINLOCK_INITIALIZER();
+
 int uk_intctlr_irq_alloc(unsigned int *irqs, __sz count)
 {
 	unsigned long start, idx;
+	unsigned long irqf;
+	int rc = 0;
 
 	UK_ASSERT(irqs);
+
+	irqf = uk_lcpu_save_irqf();
+	ukarch_spin_lock(&irq_alloc_lock);
 
 	start = uk_bitmap_find_next_zero_area(irqs_allocated,
 					      ALLOCABLE_IRQ_COUNT, 0,
 					      count, 0);
-	if (start == ALLOCABLE_IRQ_COUNT)
-		return -ENOSPC;
+	if (start == ALLOCABLE_IRQ_COUNT) {
+		rc = -ENOSPC;
+		goto out;
+	}
 
 	uk_bitmap_set(irqs_allocated, start, count);
 	for (idx = start; idx < (start + count); idx++) {
@@ -265,14 +284,21 @@ int uk_intctlr_irq_alloc(unsigned int *irqs, __sz count)
 		irqs++;
 	}
 
-	return 0;
+out:
+	ukarch_spin_unlock(&irq_alloc_lock);
+	uk_lcpu_restore_irqf(irqf);
+	return rc;
 }
 
 int uk_intctlr_irq_free(unsigned int *irqs, __sz count)
 {
 	int rc = 0;
+	unsigned long irqf;
 
 	UK_ASSERT(irqs);
+
+	irqf = uk_lcpu_save_irqf();
+	ukarch_spin_lock(&irq_alloc_lock);
 
 	for (__sz i = 0; i < count; i++) {
 		UK_ASSERT(irqs[i] >= FIRST_ALLOCABLE_IRQ &&
@@ -283,6 +309,8 @@ int uk_intctlr_irq_free(unsigned int *irqs, __sz count)
 		UK_ASSERT(rc);
 	}
 
+	ukarch_spin_unlock(&irq_alloc_lock);
+	uk_lcpu_restore_irqf(irqf);
 	return !rc;
 }
 

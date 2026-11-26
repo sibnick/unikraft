@@ -37,6 +37,8 @@
 #include <uk/plat/common/bootinfo.h>
 #include <uk/asm/limits.h>
 #include <uk/alloc.h>
+#include <uk/arch/spinlock.h>
+#include <uk/lcpu.h>
 #include <uk/paging.h>
 
 extern struct ukplat_memregion_desc bpt_unmap_mrd;
@@ -62,7 +64,18 @@ struct uk_alloc *ukplat_memallocator_get(void)
 	return plat_allocator;
 }
 
-void *ukplat_memregion_alloc(__sz size, int type, __u16 flags)
+/*
+ * Guards the bootinfo memory-region list. ukplat_memregion_alloc scans a
+ * free region descriptor, shrinks it in place, and inserts the carved
+ * region. On an SMP guest the JVM driver carves AP stacks and per-core
+ * pools from here while the BSP allocates through the same path; without
+ * the lock two cores carve the same physical pages and corrupt the
+ * descriptor list. The lock is taken with interrupts off, following the
+ * bbuddy and ukconsole precedent. [Ticket f05cbd814a]
+ */
+static __spinlock mrd_alloc_lock = UKARCH_SPINLOCK_INITIALIZER();
+
+static void *memregion_alloc_locked(__sz size, int type, __u16 flags)
 {
 	struct ukplat_memregion_desc *mrd, alloc_mrd = {0};
 	struct ukplat_bootinfo *bi;
@@ -138,6 +151,20 @@ void *ukplat_memregion_alloc(__sz size, int type, __u16 flags)
 	}
 
 	return NULL;
+}
+
+void *ukplat_memregion_alloc(__sz size, int type, __u16 flags)
+{
+	unsigned long irqf;
+	void *p;
+
+	irqf = uk_lcpu_save_irqf();
+	ukarch_spin_lock(&mrd_alloc_lock);
+	p = memregion_alloc_locked(size, type, flags);
+	ukarch_spin_unlock(&mrd_alloc_lock);
+	uk_lcpu_restore_irqf(irqf);
+
+	return p;
 }
 
 /* We want a criteria based on which we decide which memory region to keep,
