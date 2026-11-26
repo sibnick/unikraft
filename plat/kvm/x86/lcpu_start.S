@@ -424,6 +424,39 @@ no_pku:
 no_avx512:
 #endif /* !__AVX512F__ */
 
+#if CONFIG_HAVE_SYSCALL
+	/* Program the SYSCALL/SYSRET entry state. The BSP sets these MSRs
+	 * in its C entry (_ukplat_entry), which APs never run, and
+	 * INIT/SIPI leaves them clear on every AP. With LSTAR left zero,
+	 * the first SYSCALL on this core loads RIP from 0 and dies. The
+	 * values mirror those _init_syscall() programs on the BSP, and
+	 * the trampoline runs after the image is relocated, so the
+	 * RIP-relative address of _ukplat_syscall is its final
+	 * address. [Ticket f05cbd814a]
+	 */
+	movl	$UK_ARCH_X86_64_MSR_STAR, %ecx
+	movl	$0x00080008, %edx	/* STAR: CS base and sysret CS
+					 * both 0x08, as on the BSP */
+	xorl	%eax, %eax
+	wrmsr
+
+	movl	$UK_ARCH_X86_64_MSR_LSTAR, %ecx
+	leaq	_ukplat_syscall(%rip), %rax
+	movq	%rax, %rdx
+	shrq	$32, %rdx
+	wrmsr
+
+	.set	SYSCALL_FLAGS_MASK, UK_ARCH_X86_64_RFLAGS_TF | \
+			UK_ARCH_X86_64_RFLAGS_DF | \
+			UK_ARCH_X86_64_RFLAGS_IF | \
+			UK_ARCH_X86_64_RFLAGS_AC | \
+			UK_ARCH_X86_64_RFLAGS_NT
+	movl	$UK_ARCH_X86_64_MSR_SYSCALL_MASK, %ecx
+	movl	$SYSCALL_FLAGS_MASK, %eax
+	xorl	%edx, %edx
+	wrmsr
+#endif /* CONFIG_HAVE_SYSCALL */
+
 	movq	UK_PCPUVAR_X86_64_GSREL(UK_LCPU_SARG_SYM), %rdi
 	movq	UK_PCPUVAR_X86_64_GSREL(UK_LCPU_SENTRY_SYM), %rax
 	movq	UK_PCPUVAR_X86_64_GSREL(UK_LCPU_SSTACKP_SYM), %rsp
