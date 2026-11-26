@@ -40,6 +40,8 @@
 #include <uk/bitops.h>
 #include <uk/bitops/bitscan.h>
 #include <uk/atomic.h>
+#include <uk/arch/spinlock.h>
+#include <uk/lcpu.h>
 #include <uk/list.h>
 #include <uk/paging.h>
 #include <uk/print.h>
@@ -167,6 +169,9 @@ struct buddy_framealloc {
 
 	struct uk_list_head free_list[BFA_LEVELS];
 	unsigned int free_list_map;
+
+	/* Guards the buddy free lists and the zone bitmaps. */
+	__spinlock lock;
 };
 
 /* Forward declarations */
@@ -1482,14 +1487,99 @@ static int bfa_addmem(struct uk_falloc *fa, void *metadata, __paddr_t paddr,
 	return bfa_do_addmem(bfa, metadata, paddr, len, dm_off);
 }
 
+/*
+ * Frame-allocation synchronization. The buddy free lists and the zone
+ * allocation bitmaps are touched by every map and unmap. On an SMP
+ * guest the CPUs demand-page concurrently: APs fault on their thread
+ * stacks and on the thread structures the affinity migration path
+ * allocates, while the BSP pages the same heap. Unlocked, two CPUs pop
+ * the same free block or split it twice, which is what the freelist
+ * sanity check catches. The lock is per allocator instance, taken with
+ * interrupts off like the heap lock. uk_paging serializes whole
+ * mutations above this layer, so the lock order is paging -> frame
+ * allocator; the adders here are leaves and call no other allocator.
+ * [Ticket f05cbd814a]
+ */
+static inline unsigned long bfa_lock(struct buddy_framealloc *bfa)
+{
+	unsigned long flags = uk_lcpu_save_irqf();
+
+	ukarch_spin_lock(&bfa->lock);
+	return flags;
+}
+
+static inline void bfa_unlock(struct buddy_framealloc *bfa,
+			      unsigned long flags)
+{
+	ukarch_spin_unlock(&bfa->lock);
+	uk_lcpu_restore_irqf(flags);
+}
+
+static int bfa_alloc_sync(struct uk_falloc *fa, __paddr_t *paddr,
+			  unsigned long frames, unsigned long flags)
+{
+	struct buddy_framealloc *bfa = (struct buddy_framealloc *)fa;
+	unsigned long irqf;
+	int rc;
+
+	irqf = bfa_lock(bfa);
+	rc = bfa_alloc(fa, paddr, frames, flags);
+	bfa_unlock(bfa, irqf);
+	return rc;
+}
+
+static int bfa_alloc_from_range_sync(struct uk_falloc *fa, __paddr_t *paddr,
+				     unsigned long frames,
+				     unsigned long flags,
+				     __paddr_t min, __paddr_t max)
+{
+	struct buddy_framealloc *bfa = (struct buddy_framealloc *)fa;
+	unsigned long irqf;
+	int rc;
+
+	irqf = bfa_lock(bfa);
+	rc = bfa_alloc_from_range(fa, paddr, frames, flags, min, max);
+	bfa_unlock(bfa, irqf);
+	return rc;
+}
+
+static int bfa_free_sync(struct uk_falloc *fa, __paddr_t paddr,
+			 unsigned long frames)
+{
+	struct buddy_framealloc *bfa = (struct buddy_framealloc *)fa;
+	unsigned long irqf;
+	int rc;
+
+	irqf = bfa_lock(bfa);
+	rc = bfa_free(fa, paddr, frames);
+	bfa_unlock(bfa, irqf);
+	return rc;
+}
+
+static int bfa_addmem_sync(struct uk_falloc *fa, void *metadata,
+			   __paddr_t paddr, unsigned long frames,
+			   __vaddr_t dm_off)
+{
+	struct buddy_framealloc *bfa = (struct buddy_framealloc *)fa;
+	unsigned long irqf;
+	int rc;
+
+	irqf = bfa_lock(bfa);
+	rc = bfa_addmem(fa, metadata, paddr, frames, dm_off);
+	bfa_unlock(bfa, irqf);
+	return rc;
+}
+
 int uk_fallocbuddy_init(struct uk_falloc *fa)
 {
 	struct buddy_framealloc *bfa = (struct buddy_framealloc *)fa;
 	unsigned int i;
 	int rc;
 
-	rc = uk_falloc_init(fa, bfa_alloc, bfa_alloc_from_range,
-			    bfa_free, bfa_addmem);
+	ukarch_spin_init(&bfa->lock);
+
+	rc = uk_falloc_init(fa, bfa_alloc_sync, bfa_alloc_from_range_sync,
+			    bfa_free_sync, bfa_addmem_sync);
 
 	for (i = 0; i < BFA_LEVELS; i++)
 		UK_INIT_LIST_HEAD(&bfa->free_list[i]);

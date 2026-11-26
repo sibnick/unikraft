@@ -22,6 +22,19 @@
 #include <uk/paging/arch.h>
 #include <uk/paging.h>
 #include <uk/pt.h>
+#include <uk/arch/spinlock.h>
+#include <uk/lcpu.h>
+
+/* Page-table mutation bodies, wrapped by the public entries below. */
+static int uk_paging_page_mapx_inner(struct uk_pagetable *pt,
+	__vaddr_t vaddr, __paddr_t paddr, unsigned long pages,
+	unsigned long attr, unsigned long flags,
+	struct uk_paging_page_mapx *mapx);
+static int uk_paging_page_unmap_inner(struct uk_pagetable *pt,
+	__vaddr_t vaddr, unsigned long pages, unsigned long flags);
+static int uk_paging_page_set_attr_inner(struct uk_pagetable *pt,
+	__vaddr_t vaddr, unsigned long pages, unsigned long new_attr,
+	unsigned long flags);
 #include <uk/plat/memory.h>
 #include <uk/print.h>
 
@@ -783,7 +796,77 @@ NEXT_PTE:
 	return 0;
 }
 
+/*
+ * Serializes page-table mutations. Concurrent demand paging is the
+ * normal SMP case: APs fault on thread stacks and on the thread
+ * structures the affinity migration path allocates, while the BSP pages
+ * the same heap. A map mutates the table in several steps (walk, frame
+ * and intermediate-table allocation, entry install); run from two CPUs
+ * at once those steps split the same free block twice or install two
+ * tables at one entry. The lock spans the whole mutation. Lock order:
+ * ukvmem vma tree -> paging -> frame allocator (see fallocbuddy); the
+ * inner paths call the frame allocator but no allocator above them.
+ * Walk-only readers stay lock-free: an entry is written once, invalid
+ * to valid, as a single aligned store. [Ticket f05cbd814a]
+ */
+static __spinlock paging_lock = UKARCH_SPINLOCK_INITIALIZER();
+
+static unsigned long paging_lock_acquire(void)
+{
+	unsigned long flags = uk_lcpu_save_irqf();
+
+	ukarch_spin_lock(&paging_lock);
+	return flags;
+}
+
+static void paging_lock_release(unsigned long flags)
+{
+	ukarch_spin_unlock(&paging_lock);
+	uk_lcpu_restore_irqf(flags);
+}
+
+/* Public entries: the map lock around the mutation bodies. */
 int uk_paging_page_mapx(struct uk_pagetable *pt, __vaddr_t vaddr,
+			__paddr_t paddr, unsigned long pages,
+			unsigned long attr, unsigned long flags,
+			struct uk_paging_page_mapx *mapx)
+{
+	unsigned long irqf;
+	int rc;
+
+	irqf = paging_lock_acquire();
+	rc = uk_paging_page_mapx_inner(pt, vaddr, paddr, pages, attr, flags,
+				       mapx);
+	paging_lock_release(irqf);
+	return rc;
+}
+
+int uk_paging_page_unmap(struct uk_pagetable *pt, __vaddr_t vaddr,
+			 unsigned long pages, unsigned long flags)
+{
+	unsigned long irqf;
+	int rc;
+
+	irqf = paging_lock_acquire();
+	rc = uk_paging_page_unmap_inner(pt, vaddr, pages, flags);
+	paging_lock_release(irqf);
+	return rc;
+}
+
+int uk_paging_page_set_attr(struct uk_pagetable *pt, __vaddr_t vaddr,
+			    unsigned long pages, unsigned long new_attr,
+			    unsigned long flags)
+{
+	unsigned long irqf;
+	int rc;
+
+	irqf = paging_lock_acquire();
+	rc = uk_paging_page_set_attr_inner(pt, vaddr, pages, new_attr, flags);
+	paging_lock_release(irqf);
+	return rc;
+}
+
+static int uk_paging_page_mapx_inner(struct uk_pagetable *pt, __vaddr_t vaddr,
 			__paddr_t paddr, unsigned long pages,
 			unsigned long attr, unsigned long flags,
 			struct uk_paging_page_mapx *mapx)
@@ -1109,7 +1192,7 @@ static int pg_page_unmap(struct uk_pagetable *pt, __vaddr_t pt_vaddr,
 	return 0;
 }
 
-int uk_paging_page_unmap(struct uk_pagetable *pt, __vaddr_t vaddr,
+static int uk_paging_page_unmap_inner(struct uk_pagetable *pt, __vaddr_t vaddr,
 			 unsigned long pages, unsigned long flags)
 {
 	unsigned int level = UK_PAGING_PAGE_FLAG_SIZE_TO_LEVEL(flags);
@@ -1284,7 +1367,7 @@ static int pg_page_set_attr(struct uk_pagetable *pt, __vaddr_t pt_vaddr,
 	return 0;
 }
 
-int uk_paging_page_set_attr(struct uk_pagetable *pt, __vaddr_t vaddr,
+static int uk_paging_page_set_attr_inner(struct uk_pagetable *pt, __vaddr_t vaddr,
 			    unsigned long pages, unsigned long new_attr,
 			    unsigned long flags)
 {
