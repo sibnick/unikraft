@@ -29,23 +29,45 @@ static struct uk_vas *vmem_active_vas;
 
 /* Per-VAS critical section: IRQs off + spinlock, so the tree is protected
  * against page-fault handling and concurrent map/unmap from other CPUs.
- * Re-entrancy contract: the guarded sections only call static vmem_vma_*
- * tree helpers, uk_vma_ops callbacks and ukpaging/ukfallocbuddy functions
- * (downward in the lock order). They never dereference process-range
- * addresses that could fault back into vmem_pagefault(): heap, page-table
- * and direct-map (kmap) accesses bypass this fault handler, which only
- * covers regions managed by a uk_vas. [Ticket f05cbd814a]
+ * The lock is recursive on the owning CPU: guarded sections allocate VMA
+ * structs and call uk_vma_ops callbacks that allocate from the heap, and
+ * the heap is demand-paged through the same address space, so such an
+ * allocation can fault and re-enter vmem_pagefault() on the same CPU with
+ * the lock held. A plain spinlock would self-deadlock there. lock_owner
+ * and lock_nest track that nesting: only the outermost lock() takes the
+ * spinlock and masks IRQs, only the outermost unlock() releases them.
+ * A page fault on another CPU while the owner holds the lock blocks on
+ * the spinlock; that is safe because only the owner mutates the tree and
+ * it does not release until its outermost section finishes. The guarded
+ * sections call only static vmem_vma_* tree helpers, uk_vma_ops callbacks
+ * and ukpaging/ukfallocbuddy functions (downward in the lock order);
+ * nothing below ukvmem calls back into ukvmem holding a lower-layer lock.
+ * [Ticket f05cbd814a]
  */
 static unsigned long vmem_vas_lock(struct uk_vas *vas)
 {
-	unsigned long flags = uk_lcpu_save_irqf();
+	struct uk_lcpu *me = uk_lcpu_get_current();
+	unsigned long flags;
 
+	if (vas->lock_owner == me) {
+		vas->lock_nest++;
+		return uk_lcpu_save_irqf();
+	}
+
+	flags = uk_lcpu_save_irqf();
 	ukarch_spin_lock(&vas->lock);
+	vas->lock_owner = me;
+	vas->lock_nest = 1;
 	return flags;
 }
 
 static void vmem_vas_unlock(struct uk_vas *vas, unsigned long flags)
 {
+	UK_ASSERT(vas->lock_owner == uk_lcpu_get_current());
+
+	if (--vas->lock_nest > 0)
+		return;
+	vas->lock_owner = NULL;
 	ukarch_spin_unlock(&vas->lock);
 	uk_lcpu_restore_irqf(flags);
 }

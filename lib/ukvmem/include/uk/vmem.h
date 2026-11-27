@@ -79,11 +79,23 @@ struct uk_vas {
 	 * callbacks always run with it held and must not take it again.
 	 * Lock order is ukvmem (this lock) -> ukpaging -> ukfallocbuddy:
 	 * nothing below ukvmem ever calls back into ukvmem while holding
-	 * a lower-layer lock. The lock is NOT recursive; call the static
-	 * *_locked() bodies directly when the lock is already held.
+	 * a lower-layer lock.
+	 *
+	 * The lock is recursive on the owning CPU. A guarded section
+	 * allocates through the heap allocator (VMA structs, ops
+	 * callbacks); the heap is demand-paged through this same VAS, so
+	 * a page fault can fire while the lock is held and re-enter
+	 * vmem_pagefault() on the same CPU. lock_owner and lock_nest
+	 * track that nesting: only the outermost lock() takes the
+	 * spinlock and masks IRQs, only the outermost unlock() releases
+	 * them. Other CPUs never re-enter: their fault handler blocks on
+	 * the spinlock the owner holds. call the static *_locked()
+	 * bodies directly when the lock is already held on the same CPU.
 	 * [Ticket f05cbd814a]
 	 */
 	__spinlock lock;
+	void *lock_owner;
+	unsigned int lock_nest;
 };
 
 /**
