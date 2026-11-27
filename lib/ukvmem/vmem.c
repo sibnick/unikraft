@@ -18,6 +18,8 @@
 #include <uk/assert.h>
 #include <uk/list.h>
 #include <uk/config.h>
+#include <uk/arch/spinlock.h>
+#include <uk/lcpu.h>
 
 /*
  * Pointer to currently active virtual address space.
@@ -25,9 +27,48 @@
  */
 static struct uk_vas *vmem_active_vas;
 
+/* Per-VAS critical section: IRQs off + spinlock, so the tree is protected
+ * against page-fault handling and concurrent map/unmap from other CPUs.
+ * Re-entrancy contract: the guarded sections only call static vmem_vma_*
+ * tree helpers, uk_vma_ops callbacks and ukpaging/ukfallocbuddy functions
+ * (downward in the lock order). They never dereference process-range
+ * addresses that could fault back into vmem_pagefault(): heap, page-table
+ * and direct-map (kmap) accesses bypass this fault handler, which only
+ * covers regions managed by a uk_vas. [Ticket f05cbd814a]
+ */
+static unsigned long vmem_vas_lock(struct uk_vas *vas)
+{
+	unsigned long flags = uk_lcpu_save_irqf();
+
+	ukarch_spin_lock(&vas->lock);
+	return flags;
+}
+
+static void vmem_vas_unlock(struct uk_vas *vas, unsigned long flags)
+{
+	ukarch_spin_unlock(&vas->lock);
+	uk_lcpu_restore_irqf(flags);
+}
+
 /* Forward declarations */
 static void vmem_vma_unmap(struct uk_vma *vma, __vaddr_t vaddr, __sz len);
 static void vmem_vma_unlink_and_free(struct uk_vma *vma);
+static int uk_vma_map_locked(struct uk_vas *vas, __vaddr_t *vaddr, __sz len,
+			     unsigned long attr, unsigned long flags,
+			     const char *name,
+			     const struct uk_vma_ops *ops, void *args);
+static int uk_vma_unmap_locked(struct uk_vas *vas, __vaddr_t vaddr, __sz len,
+			       unsigned long flags);
+static int uk_vma_set_attr_locked(struct uk_vas *vas, __vaddr_t vaddr,
+				  __sz len, unsigned long attr,
+				  unsigned long flags);
+static int uk_vma_advise_locked(struct uk_vas *vas, __vaddr_t vaddr, __sz len,
+				unsigned long advice, unsigned long flags);
+#ifdef CONFIG_LIBUKPAGING
+static int vmem_pagefault_locked(struct uk_vas *vas, __vaddr_t vaddr,
+				 unsigned int type,
+				 struct uk_lcpu_regs *regs);
+#endif /* CONFIG_LIBUKPAGING */
 
 struct uk_vas *uk_vas_get_active(void)
 {
@@ -55,6 +96,8 @@ int uk_vas_init(struct uk_vas *vas, struct uk_pagetable *pt __maybe_unused,
 	UK_ASSERT(pt);
 	UK_ASSERT(a);
 
+	ukarch_spin_init(&vas->lock);
+
 	vas->a = a;
 
 #ifdef CONFIG_LIBUKPAGING
@@ -74,6 +117,9 @@ int uk_vas_init(struct uk_vas *vas, struct uk_pagetable *pt __maybe_unused,
 void uk_vas_destroy(struct uk_vas *vas)
 {
 	struct uk_vma *vma, *next;
+	unsigned long irq_flags;
+
+	irq_flags = vmem_vas_lock(vas);
 
 	uk_list_for_each_entry_safe(vma, next, &vas->vma_list, vma_list) {
 		vmem_vma_unmap(vma, vma->start, uk_vma_len(vma));
@@ -81,6 +127,8 @@ void uk_vas_destroy(struct uk_vas *vas)
 	}
 
 	UK_ASSERT(uk_list_empty(&vas->vma_list));
+
+	vmem_vas_unlock(vas, irq_flags);
 
 	if (vmem_active_vas == vas)
 		vmem_active_vas = __NULL;
@@ -125,7 +173,14 @@ static struct uk_vma *vmem_vma_find(struct uk_vas *vas, __vaddr_t vaddr,
 
 const struct uk_vma *uk_vma_find(struct uk_vas *vas, __vaddr_t vaddr)
 {
-	return vmem_vma_find(vas, vaddr, 0);
+	const struct uk_vma *vma;
+	unsigned long irq_flags;
+
+	irq_flags = vmem_vas_lock(vas);
+	vma = vmem_vma_find(vas, vaddr, 0);
+	vmem_vas_unlock(vas, irq_flags);
+
+	return vma;
 }
 
 static int vmem_vma_find_range(struct uk_vas *vas, __vaddr_t *vaddr, __sz *len,
@@ -507,6 +562,20 @@ static void vmem_vma_unmap_and_free_vmas(struct uk_vma *start,
 int uk_vma_unmap(struct uk_vas *vas, __vaddr_t vaddr, __sz len,
 		 unsigned long flags)
 {
+	unsigned long irq_flags;
+	int rc;
+
+	irq_flags = vmem_vas_lock(vas);
+	rc = uk_vma_unmap_locked(vas, vaddr, len, flags);
+	vmem_vas_unlock(vas, irq_flags);
+
+	return rc;
+}
+
+/* Called with vas->lock held. */
+static int uk_vma_unmap_locked(struct uk_vas *vas, __vaddr_t vaddr, __sz len,
+			       unsigned long flags)
+{
 	struct uk_vma *vma_start = __NULL, *vma_end;
 	int strict = (flags & UK_VMA_FLAG_STRICT_VMA_CHECK);
 	int rc;
@@ -604,6 +673,22 @@ static int vmem_mapx_populate(struct uk_pagetable *pt __unused,
 int uk_vma_map(struct uk_vas *vas, __vaddr_t *vaddr, __sz len,
 	       unsigned long attr, unsigned long flags, const char *name,
 	       const struct uk_vma_ops *ops, void *args)
+{
+	unsigned long irq_flags;
+	int rc;
+
+	irq_flags = vmem_vas_lock(vas);
+	rc = uk_vma_map_locked(vas, vaddr, len, attr, flags, name, ops, args);
+	vmem_vas_unlock(vas, irq_flags);
+
+	return rc;
+}
+
+/* Called with vas->lock held. */
+static int uk_vma_map_locked(struct uk_vas *vas, __vaddr_t *vaddr, __sz len,
+			     unsigned long attr, unsigned long flags,
+			     const char *name,
+			     const struct uk_vma_ops *ops, void *args)
 {
 	unsigned int order = UK_VMA_MAP_SIZE_TO_ORDER(flags);
 	int rc, to_lvl, algn_lvl, strict;
@@ -838,6 +923,21 @@ static void vmem_vma_set_attr_vmas(struct uk_vma *start, struct uk_vma *end,
 int uk_vma_set_attr(struct uk_vas *vas, __vaddr_t vaddr, __sz len,
 		    unsigned long attr, unsigned long flags)
 {
+	unsigned long irq_flags;
+	int rc;
+
+	irq_flags = vmem_vas_lock(vas);
+	rc = uk_vma_set_attr_locked(vas, vaddr, len, attr, flags);
+	vmem_vas_unlock(vas, irq_flags);
+
+	return rc;
+}
+
+/* Called with vas->lock held. */
+static int uk_vma_set_attr_locked(struct uk_vas *vas, __vaddr_t vaddr,
+				  __sz len, unsigned long attr,
+				  unsigned long flags)
+{
 	struct uk_vma *vma_start = __NULL, *vma_end;
 	int strict = (flags & UK_VMA_FLAG_STRICT_VMA_CHECK);
 	int rc;
@@ -938,6 +1038,20 @@ static int vmem_vma_advise(struct uk_vma *vma, __vaddr_t vaddr, __sz len,
 
 int uk_vma_advise(struct uk_vas *vas, __vaddr_t vaddr, __sz len,
 		  unsigned long advice, unsigned long flags)
+{
+	unsigned long irq_flags;
+	int rc;
+
+	irq_flags = vmem_vas_lock(vas);
+	rc = uk_vma_advise_locked(vas, vaddr, len, advice, flags);
+	vmem_vas_unlock(vas, irq_flags);
+
+	return rc;
+}
+
+/* Called with vas->lock held. */
+static int uk_vma_advise_locked(struct uk_vas *vas, __vaddr_t vaddr, __sz len,
+				unsigned long advice, unsigned long flags)
 {
 	struct uk_vma *vma_start = __NULL, *vma_end, *vma;
 	int strict = (flags & UK_VMA_FLAG_STRICT_VMA_CHECK);
@@ -1053,9 +1167,29 @@ static int vmem_mapx_pagefault(struct uk_pagetable *pt __unused,
 int vmem_pagefault(__vaddr_t vaddr, unsigned int type,
 		   struct uk_lcpu_regs *regs)
 {
+	struct uk_vas *vas;
+	unsigned long irq_flags;
+	int rc;
+
+	/* Check if a virtual address space is set */
+	vas = uk_vas_get_active();
+	if (unlikely(!vas || vas->flags & UK_VAS_FLAG_NO_PAGING))
+		return -EFAULT;
+
+	irq_flags = vmem_vas_lock(vas);
+	rc = vmem_pagefault_locked(vas, vaddr, type, regs);
+	vmem_vas_unlock(vas, irq_flags);
+
+	return rc;
+}
+
+/* Called with vas->lock held. */
+static int vmem_pagefault_locked(struct uk_vas *vas, __vaddr_t vaddr,
+				 unsigned int type,
+				 struct uk_lcpu_regs *regs)
+{
 	const unsigned int demand_lvl =
 		UK_PAGING_PAGE_SHIFT_Lx(CONFIG_LIBUKVMEM_DEMAND_PAGE_IN_SIZE);
-	struct uk_vas *vas;
 	struct uk_pagetable *pt;
 	struct mapx_pagefault_ctx ctx = {
 		.vaddr = vaddr,
@@ -1070,11 +1204,6 @@ int vmem_pagefault(__vaddr_t vaddr, unsigned int type,
 	unsigned int lvl = UK_PAGING_PAGE_LEVEL;
 	unsigned long flags;
 	int rc;
-
-	/* Check if a virtual address space is set */
-	vas = uk_vas_get_active();
-	if (unlikely(!vas || vas->flags & UK_VAS_FLAG_NO_PAGING))
-		return -EFAULT;
 
 	/* If the page fault was caused by an access to a region not covered by
 	 * a virtual memory area, fail early.

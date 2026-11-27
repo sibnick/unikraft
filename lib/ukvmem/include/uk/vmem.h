@@ -38,6 +38,7 @@
 #include <uk/arch/types.h>
 #include <uk/list.h>
 #include <uk/alloc.h>
+#include <uk/arch/spinlock.h>
 #ifdef CONFIG_LIBUKPAGING
 #include <uk/paging.h>
 #endif /* CONFIG_LIBUKPAGING */
@@ -70,6 +71,19 @@ struct uk_vas {
 	/** VAS flags */
 #define UK_VAS_FLAG_NO_PAGING		0x1 /* On-demand paging disabled */
 	unsigned long flags;
+
+	/* Lock protecting vma_list and all VMA tree metadata against
+	 * concurrent page-fault handling and map/unmap operations running
+	 * on other CPUs. Only the public uk_vma_* entry points,
+	 * uk_vas_destroy() and the page-fault handler take it; uk_vma_ops
+	 * callbacks always run with it held and must not take it again.
+	 * Lock order is ukvmem (this lock) -> ukpaging -> ukfallocbuddy:
+	 * nothing below ukvmem ever calls back into ukvmem while holding
+	 * a lower-layer lock. The lock is NOT recursive; call the static
+	 * *_locked() bodies directly when the lock is already held.
+	 * [Ticket f05cbd814a]
+	 */
+	__spinlock lock;
 };
 
 /**
