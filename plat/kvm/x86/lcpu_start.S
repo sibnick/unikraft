@@ -238,15 +238,7 @@ ENTRY(lcpu_start32)
 	 * is a reserved-bit violation that shuts the core down on its
 	 * first write.
 	 */
-	movl	$EFER_BOOT32_SETTINGS, %ebx
-	xorl	%ecx, %ecx
-	movl	$0x80000001, %eax
-	cpuid
-	testl	$UK_ARCH_X86_64_CPUID81_NX, %edx
-	jz	1f
-	orl	$UK_ARCH_X86_64_EFER_NXE, %ebx
-1:
-	movl	%ebx, %eax
+	movl	$EFER_BOOT32_SETTINGS, %eax
 	xorl	%edx, %edx
 	movl	$UK_ARCH_X86_64_MSR_EFER, %ecx
 	wrmsr
@@ -337,6 +329,29 @@ ENTRY(lcpu_start64)
 	 */
 	leaq	uk_lcpus(%rip), %rbp
 	addq	%rsp, %rbp
+
+	/* Enable the Execute Disable Bit now, in 64-bit mode, before the
+	 * kernel page tables below are loaded. The BSP and the APs both
+	 * enter lcpu_start32 from their boot paths, and KVM rejects an
+	 * EFER write that sets NXE while LME is clear: an early WRMSR in
+	 * 32-bit mode faults #GP before any IDT exists and triple-faults
+	 * the CPU. In long mode the write is legal for both cores. NXE
+	 * must be set before CR3: the live kernel tables mark data pages
+	 * NX, and with NXE clear KVM treats bit 63 as reserved and the
+	 * guest shuts down on the first walk of such an entry. Probe
+	 * CPUID 80000001H:EDX.NX so a CPU without the feature keeps the
+	 * old behavior. [Ticket f05cbd814a]
+	 */
+	movl	$0x80000001, %eax
+	xorl	%ecx, %ecx
+	cpuid
+	testl	$UK_ARCH_X86_64_CPUID81_NX, %edx
+	jz	4f
+	movl	$UK_ARCH_X86_64_MSR_EFER, %ecx
+	rdmsr
+	orl	$UK_ARCH_X86_64_EFER_NXE, %eax
+	wrmsr
+4:
 
 	/* The trampoline still runs on the boot page table (identity map
 	 * of the first 4GiB), but the kernel may have long since switched
