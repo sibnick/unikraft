@@ -67,7 +67,7 @@ static void vmem_vas_unlock(struct uk_vas *vas, unsigned long flags)
 {
 	struct uk_lcpu *me = uk_lcpu_get_current();
 
-	if (__unlikely(vas->lock_owner != me || vas->lock_nest == 0)) {
+	if (unlikely(vas->lock_owner != me || vas->lock_nest == 0)) {
 		uk_pr_crit("vmem: unlock mismatch vas=%p owner=%p cur=%p nest=%u\n",
 			   vas, vas->lock_owner, me, vas->lock_nest);
 		UK_CRASH("vmem: per-VAS lock ownership lost\n");
