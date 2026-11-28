@@ -24,6 +24,7 @@
 #include <uk/crash.h>
 #include <uk/thread.h>
 #include <uk/sched.h>
+#include <uk/plat/time.h>
 
 /*
  * Pointer to currently active virtual address space.
@@ -70,17 +71,21 @@ static void *vmem_lock_token(void)
 	return t ? (void *)t : (void *)uk_lcpu_get_current();
 }
 
-/* Debug-branch instrumentation: ring of the last lock operations. [Ticket 0b5fc23821] */
+/* Debug-branch instrumentation: per-CPU rings of lock operations, so
+ * concurrent CPUs never share an index. Timestamps let the dump be
+ * reordered globally. [Ticket 0b5fc23821] */
 struct vmem_op {
 	char op;		/* A=acquire R=recursive U=unlock-dec F=final-release */
 	void *token;
 	void *owner;
 	unsigned int nest;
-	int cpu;		/* cpu_id of the current thread's scheduler */
+	__u64 t;		/* monotonic ns */
+	int cpu;
 };
 #define VMEM_OPS_N 64
-static volatile struct vmem_op vmem_ops[VMEM_OPS_N];
-static volatile unsigned int vmem_ops_next;
+#define VMEM_OPS_CPUS 8
+static volatile struct vmem_op vmem_ops[VMEM_OPS_CPUS][VMEM_OPS_N];
+static volatile unsigned int vmem_ops_next[VMEM_OPS_CPUS];
 
 static int vmem_cur_cpu(void)
 {
@@ -93,28 +98,38 @@ static int vmem_cur_cpu(void)
 
 static void vmem_op_log(char op, void *token, void *owner, unsigned int nest)
 {
-	unsigned int i = vmem_ops_next++ % VMEM_OPS_N;
+	int cpu = vmem_cur_cpu();
+	unsigned int i;
 
-	vmem_ops[i].op = op;
-	vmem_ops[i].token = token;
-	vmem_ops[i].owner = owner;
-	vmem_ops[i].nest = nest;
-	vmem_ops[i].cpu = vmem_cur_cpu();
+	if (cpu < 0 || cpu >= VMEM_OPS_CPUS)
+		return;
+	i = vmem_ops_next[cpu]++ % VMEM_OPS_N;
+	vmem_ops[cpu][i].op = op;
+	vmem_ops[cpu][i].token = token;
+	vmem_ops[cpu][i].owner = owner;
+	vmem_ops[cpu][i].nest = nest;
+	vmem_ops[cpu][i].t = ukplat_monotonic_clock();
+	vmem_ops[cpu][i].cpu = cpu;
 }
 
 static void vmem_op_dump(void)
 {
-	unsigned int n = vmem_ops_next;
-	unsigned int start = (n > VMEM_OPS_N) ? n - VMEM_OPS_N : 0;
-	unsigned int k;
+	unsigned int c, k, n;
 
-	for (k = start; k < n; k++) {
-		unsigned int i = k % VMEM_OPS_N;
+	/* Per-CPU order; print all slots with timestamps. */
+	for (c = 0; c < VMEM_OPS_CPUS; c++) {
+		n = vmem_ops_next[c];
+		if (n == 0)
+			continue;
+		uk_pr_crit("vmem-ring cpu %u (%u ops)\n", c, n);
+		for (k = (n > VMEM_OPS_N) ? n - VMEM_OPS_N : 0; k < n; k++) {
+			unsigned int i = k % VMEM_OPS_N;
 
-		uk_pr_crit("vmem-op %c token=%p owner=%p nest=%u cpu=%d\n",
-			   vmem_ops[i].op, vmem_ops[i].token,
-			   vmem_ops[i].owner, vmem_ops[i].nest,
-			   vmem_ops[i].cpu);
+			uk_pr_crit("vmem-op %c token=%p owner=%p nest=%u t=%llu\n",
+				   vmem_ops[c][i].op, vmem_ops[c][i].token,
+				   vmem_ops[c][i].owner, vmem_ops[c][i].nest,
+				   (unsigned long long)vmem_ops[c][i].t);
+		}
 	}
 }
 
