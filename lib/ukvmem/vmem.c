@@ -93,7 +93,7 @@ static int vmem_cur_cpu(void)
 
 	if (t != NULL && t->sched != NULL)
 		return t->sched->cpu_id;
-	return -1;
+	return VMEM_OPS_CPUS - 1;	/* reserved: no-thread contexts */
 }
 
 static void vmem_op_log(char op, void *token, void *owner, unsigned int nest)
@@ -104,6 +104,8 @@ static void vmem_op_log(char op, void *token, void *owner, unsigned int nest)
 	if (cpu < 0 || cpu >= VMEM_OPS_CPUS)
 		return;
 	i = vmem_ops_next[cpu]++ % VMEM_OPS_N;
+	if ((void *)uk_thread_current() != token)
+		op += 32;	/* lowercase op: token is the lcpu, not a thread */
 	vmem_ops[cpu][i].op = op;
 	vmem_ops[cpu][i].token = token;
 	vmem_ops[cpu][i].owner = owner;
