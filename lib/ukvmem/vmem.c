@@ -31,29 +31,34 @@
  */
 static struct uk_vas *vmem_active_vas;
 
-/* Per-VAS critical section: IRQs off + spinlock, so the tree is protected
- * against page-fault handling and concurrent map/unmap from other CPUs.
- * The lock is recursive on the owning thread: guarded sections allocate
- * VMA structs and call uk_vma_ops callbacks that allocate from the heap,
- * and the heap is demand-paged through the same address space, so such an
- * allocation can fault and re-enter vmem_pagefault() in the same thread
- * with the lock held. A plain spinlock would self-deadlock there.
- * [Ticket f05cbd814a]
+/* Per-VAS critical section protected by one spinlock per address
+ * space. IRQs are NOT masked. The cooperative scheduler refuses to
+ * switch threads while the lcpu IRQ counter is raised, so an IRQ mask
+ * around this section would make it non-sleepable - and it sleeps:
+ * guarded sections allocate VMA structs and call uk_vma_ops callbacks
+ * that allocate from the heap, and the heap is demand-paged through
+ * this same VAS, so such an allocation can fault and re-enter
+ * vmem_pagefault() in the same thread, or wait for a page and yield.
+ * The mask also buys no re-entry safety: an exception on the owner's
+ * own thread re-enters through the recursion token regardless of the
+ * mask, and no other thread can run on this CPU while the owner stays
+ * in its section without a scheduler switch. Cross-CPU callers are
+ * serialized by the spinlock. [Ticket f05cbd814a]
  *
- * The recursion token is the owning thread (uk_thread_current), falling
- * back to the physical lcpu before the scheduler owns a current thread.
- * A per-CPU token is wrong once several threads share a CPU, which
- * dynamic-glibc guests always do: any second thread on the owner's CPU
- * passed the old owner check, nested, and could clear the token while
- * the real holder was still inside its section. The holder may also
- * sleep inside a section (the buddy page allocator waits on a futex)
- * and the cooperative scheduler can migrate it at wake; a thread token
- * survives both. Waiters that run in thread context yield instead of
- * spinning masked, so a holder that is runnable or wakes on this CPU
- * can make progress; only thread-less contexts spin. lock_nest tracks
- * nesting: only the outermost lock() takes the spinlock and masks IRQs,
- * only the outermost unlock() releases them. The guarded sections call
- * only static vmem_vma_* tree helpers, uk_vma_ops callbacks and
+ * The recursion token is the owning thread (uk_thread_current),
+ * falling back to the physical lcpu before the scheduler owns a
+ * current thread. A per-CPU token is wrong once several threads share
+ * a CPU, which dynamic-glibc guests always do: any second thread on
+ * the owner's CPU passed the old owner check, nested, and could clear
+ * the token while the real holder was still inside its section. The
+ * holder may sleep inside a section and the cooperative scheduler can
+ * migrate it at wake; a thread token survives both. A contended
+ * acquirer in thread context yields first when this CPU holds no IRQ
+ * mask of its own, so a holder runnable here or woken by an IPI can
+ * progress; a masked or thread-less acquirer spins. lock_nest tracks
+ * nesting: only the outermost lock() takes the spinlock, only the
+ * outermost unlock() releases it. The guarded sections call only
+ * static vmem_vma_* tree helpers, uk_vma_ops callbacks and
  * ukpaging/ukfallocbuddy functions (downward in the lock order);
  * nothing below ukvmem calls back into ukvmem holding a lower-layer
  * lock. [Ticket 0b5fc23821]
@@ -68,31 +73,29 @@ static void *vmem_lock_token(void)
 static unsigned long vmem_vas_lock(struct uk_vas *vas)
 {
 	void *me = vmem_lock_token();
-	unsigned long flags;
 
-	for (;;) {
-		flags = uk_lcpu_save_irqf();
-		if (vas->lock_owner == me) {
-			vas->lock_nest++;
-			return flags;
-		}
+	/* lock_owner can only be cleared by this very thread when it
+	 * is the owner, so the token check outside the spinlock is
+	 * race-free; a match means we are already inside. */
+	while (vas->lock_owner != me) {
 		if (ukarch_spin_trylock(&vas->lock)) {
 			vas->lock_owner = me;
 			vas->lock_nest = 1;
-			return flags;
+			return 0;
 		}
-		uk_lcpu_restore_irqf(flags);
-		/* Only a thread context may hand the CPU over; a
-		 * thread-less fault spins with IRQs restored. */
-		if (uk_thread_current() != NULL)
+		if (uk_thread_current() != NULL &&
+		    !uk_lcpu_irqs_disabled())
 			uk_sched_yield();
 	}
+	vas->lock_nest++;
+	return 0;
 }
 
 static void vmem_vas_unlock(struct uk_vas *vas, unsigned long flags)
 {
 	void *me = vmem_lock_token();
 
+	(void)flags;
 	if (unlikely(vas->lock_owner != me || vas->lock_nest == 0)) {
 		uk_pr_crit("vmem: unlock mismatch vas=%p owner=%p cur=%p nest=%u\n",
 			   vas, vas->lock_owner, me, vas->lock_nest);
@@ -103,7 +106,6 @@ static void vmem_vas_unlock(struct uk_vas *vas, unsigned long flags)
 		return;
 	vas->lock_owner = NULL;
 	ukarch_spin_unlock(&vas->lock);
-	uk_lcpu_restore_irqf(flags);
 }
 
 /* Forward declarations */
