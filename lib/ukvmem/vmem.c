@@ -20,6 +20,10 @@
 #include <uk/config.h>
 #include <uk/arch/spinlock.h>
 #include <uk/lcpu.h>
+#include <uk/print.h>
+#include <uk/crash.h>
+#include <uk/thread.h>
+#include <uk/sched.h>
 
 /*
  * Pointer to currently active virtual address space.
@@ -29,41 +33,71 @@ static struct uk_vas *vmem_active_vas;
 
 /* Per-VAS critical section: IRQs off + spinlock, so the tree is protected
  * against page-fault handling and concurrent map/unmap from other CPUs.
- * The lock is recursive on the owning CPU: guarded sections allocate VMA
- * structs and call uk_vma_ops callbacks that allocate from the heap, and
- * the heap is demand-paged through the same address space, so such an
- * allocation can fault and re-enter vmem_pagefault() on the same CPU with
- * the lock held. A plain spinlock would self-deadlock there. lock_owner
- * and lock_nest track that nesting: only the outermost lock() takes the
- * spinlock and masks IRQs, only the outermost unlock() releases them.
- * A page fault on another CPU while the owner holds the lock blocks on
- * the spinlock; that is safe because only the owner mutates the tree and
- * it does not release until its outermost section finishes. The guarded
- * sections call only static vmem_vma_* tree helpers, uk_vma_ops callbacks
- * and ukpaging/ukfallocbuddy functions (downward in the lock order);
- * nothing below ukvmem calls back into ukvmem holding a lower-layer lock.
+ * The lock is recursive on the owning thread: guarded sections allocate
+ * VMA structs and call uk_vma_ops callbacks that allocate from the heap,
+ * and the heap is demand-paged through the same address space, so such an
+ * allocation can fault and re-enter vmem_pagefault() in the same thread
+ * with the lock held. A plain spinlock would self-deadlock there.
  * [Ticket f05cbd814a]
+ *
+ * The recursion token is the owning thread (uk_thread_current), falling
+ * back to the physical lcpu before the scheduler owns a current thread.
+ * A per-CPU token is wrong once several threads share a CPU, which
+ * dynamic-glibc guests always do: any second thread on the owner's CPU
+ * passed the old owner check, nested, and could clear the token while
+ * the real holder was still inside its section. The holder may also
+ * sleep inside a section (the buddy page allocator waits on a futex)
+ * and the cooperative scheduler can migrate it at wake; a thread token
+ * survives both. Waiters that run in thread context yield instead of
+ * spinning masked, so a holder that is runnable or wakes on this CPU
+ * can make progress; only thread-less contexts spin. lock_nest tracks
+ * nesting: only the outermost lock() takes the spinlock and masks IRQs,
+ * only the outermost unlock() releases them. The guarded sections call
+ * only static vmem_vma_* tree helpers, uk_vma_ops callbacks and
+ * ukpaging/ukfallocbuddy functions (downward in the lock order);
+ * nothing below ukvmem calls back into ukvmem holding a lower-layer
+ * lock. [Ticket 0b5fc23821]
  */
+static void *vmem_lock_token(void)
+{
+	struct uk_thread *t = uk_thread_current();
+
+	return t ? (void *)t : (void *)uk_lcpu_get_current();
+}
+
 static unsigned long vmem_vas_lock(struct uk_vas *vas)
 {
-	struct uk_lcpu *me = uk_lcpu_get_current();
+	void *me = vmem_lock_token();
 	unsigned long flags;
 
-	if (vas->lock_owner == me) {
-		vas->lock_nest++;
-		return uk_lcpu_save_irqf();
+	for (;;) {
+		flags = uk_lcpu_save_irqf();
+		if (vas->lock_owner == me) {
+			vas->lock_nest++;
+			return flags;
+		}
+		if (ukarch_spin_trylock(&vas->lock)) {
+			vas->lock_owner = me;
+			vas->lock_nest = 1;
+			return flags;
+		}
+		uk_lcpu_restore_irqf(flags);
+		/* Only a thread context may hand the CPU over; a
+		 * thread-less fault spins with IRQs restored. */
+		if (uk_thread_current() != NULL)
+			uk_sched_yield();
 	}
-
-	flags = uk_lcpu_save_irqf();
-	ukarch_spin_lock(&vas->lock);
-	vas->lock_owner = me;
-	vas->lock_nest = 1;
-	return flags;
 }
 
 static void vmem_vas_unlock(struct uk_vas *vas, unsigned long flags)
 {
-	UK_ASSERT(vas->lock_owner == uk_lcpu_get_current());
+	void *me = vmem_lock_token();
+
+	if (unlikely(vas->lock_owner != me || vas->lock_nest == 0)) {
+		uk_pr_crit("vmem: unlock mismatch vas=%p owner=%p cur=%p nest=%u\n",
+			   vas, vas->lock_owner, me, vas->lock_nest);
+		UK_CRASH("vmem: per-VAS lock ownership lost\n");
+	}
 
 	if (--vas->lock_nest > 0)
 		return;
