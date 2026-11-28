@@ -76,10 +76,20 @@ struct vmem_op {
 	void *token;
 	void *owner;
 	unsigned int nest;
+	int cpu;		/* cpu_id of the current thread's scheduler */
 };
 #define VMEM_OPS_N 64
 static volatile struct vmem_op vmem_ops[VMEM_OPS_N];
 static volatile unsigned int vmem_ops_next;
+
+static int vmem_cur_cpu(void)
+{
+	struct uk_thread *t = uk_thread_current();
+
+	if (t != NULL && t->sched != NULL)
+		return t->sched->cpu_id;
+	return -1;
+}
 
 static void vmem_op_log(char op, void *token, void *owner, unsigned int nest)
 {
@@ -89,6 +99,7 @@ static void vmem_op_log(char op, void *token, void *owner, unsigned int nest)
 	vmem_ops[i].token = token;
 	vmem_ops[i].owner = owner;
 	vmem_ops[i].nest = nest;
+	vmem_ops[i].cpu = vmem_cur_cpu();
 }
 
 static void vmem_op_dump(void)
@@ -100,9 +111,10 @@ static void vmem_op_dump(void)
 	for (k = start; k < n; k++) {
 		unsigned int i = k % VMEM_OPS_N;
 
-		uk_pr_crit("vmem-op %c token=%p owner=%p nest=%u\n",
+		uk_pr_crit("vmem-op %c token=%p owner=%p nest=%u cpu=%d\n",
 			   vmem_ops[i].op, vmem_ops[i].token,
-			   vmem_ops[i].owner, vmem_ops[i].nest);
+			   vmem_ops[i].owner, vmem_ops[i].nest,
+			   vmem_ops[i].cpu);
 	}
 }
 
