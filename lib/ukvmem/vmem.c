@@ -70,6 +70,42 @@ static void *vmem_lock_token(void)
 	return t ? (void *)t : (void *)uk_lcpu_get_current();
 }
 
+/* Debug-branch instrumentation: ring of the last lock operations. [Ticket 0b5fc23821] */
+struct vmem_op {
+	char op;		/* A=acquire R=recursive U=unlock-dec F=final-release */
+	void *token;
+	void *owner;
+	unsigned int nest;
+};
+#define VMEM_OPS_N 64
+static volatile struct vmem_op vmem_ops[VMEM_OPS_N];
+static volatile unsigned int vmem_ops_next;
+
+static void vmem_op_log(char op, void *token, void *owner, unsigned int nest)
+{
+	unsigned int i = vmem_ops_next++ % VMEM_OPS_N;
+
+	vmem_ops[i].op = op;
+	vmem_ops[i].token = token;
+	vmem_ops[i].owner = owner;
+	vmem_ops[i].nest = nest;
+}
+
+static void vmem_op_dump(void)
+{
+	unsigned int n = vmem_ops_next;
+	unsigned int start = (n > VMEM_OPS_N) ? n - VMEM_OPS_N : 0;
+	unsigned int k;
+
+	for (k = start; k < n; k++) {
+		unsigned int i = k % VMEM_OPS_N;
+
+		uk_pr_crit("vmem-op %c token=%p owner=%p nest=%u\n",
+			   vmem_ops[i].op, vmem_ops[i].token,
+			   vmem_ops[i].owner, vmem_ops[i].nest);
+	}
+}
+
 static unsigned long vmem_vas_lock(struct uk_vas *vas)
 {
 	void *me = vmem_lock_token();
@@ -81,12 +117,14 @@ static unsigned long vmem_vas_lock(struct uk_vas *vas)
 		if (ukarch_spin_trylock(&vas->lock)) {
 			vas->lock_owner = me;
 			vas->lock_nest = 1;
+			vmem_op_log('A', me, me, 1);
 			return 0;
 		}
 		if (uk_thread_current() != NULL &&
 		    !uk_lcpu_irqs_disabled())
 			uk_sched_yield();
 	}
+	vmem_op_log('R', me, me, vas->lock_nest);
 	vas->lock_nest++;
 	return 0;
 }
@@ -99,11 +137,15 @@ static void vmem_vas_unlock(struct uk_vas *vas, unsigned long flags)
 	if (unlikely(vas->lock_owner != me || vas->lock_nest == 0)) {
 		uk_pr_crit("vmem: unlock mismatch vas=%p owner=%p cur=%p nest=%u\n",
 			   vas, vas->lock_owner, me, vas->lock_nest);
+		vmem_op_dump();
 		UK_CRASH("vmem: per-VAS lock ownership lost\n");
 	}
+	vmem_op_log('U', me, vas->lock_owner, vas->lock_nest);
 
 	if (--vas->lock_nest > 0)
 		return;
+	if (vas->lock_nest == 0)
+		vmem_op_log('F', me, NULL, 0);
 	vas->lock_owner = NULL;
 	ukarch_spin_unlock(&vas->lock);
 }
